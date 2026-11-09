@@ -82,6 +82,47 @@ struct Settings {
     game_path: String,
 }
 
+const DEFAULT_GAME: &str = "/Applications/Risk of Rain 2.app";
+const MAIN_SIZE: [f32; 2] = [1180.0, 760.0];
+const MAIN_MIN_SIZE: [f32; 2] = [940.0, 620.0];
+
+fn resolve_game_path(saved: &str, default: &Path) -> Option<PathBuf> {
+    let saved = saved.trim();
+    if !saved.is_empty() {
+        if let Ok(game) = launch::validate_game(Path::new(saved)) {
+            return Some(game.app_path);
+        }
+    }
+    launch::validate_game(default)
+        .ok()
+        .map(|game| game.app_path)
+}
+
+fn startup_settings(paths: &Paths) -> (Settings, bool) {
+    let mut settings: Settings = fs::read(paths.root.join("settings.json"))
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default();
+    let game_path = resolve_game_path(&settings.game_path, Path::new(DEFAULT_GAME));
+    let setup_required = game_path.is_none();
+    settings.game_path = game_path
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    #[cfg(debug_assertions)]
+    let setup_required =
+        setup_required || std::env::var("R2MML_PREVIEW_SETUP").is_ok_and(|value| value == "1");
+    (settings, setup_required)
+}
+
+pub fn initial_window_dimensions() -> Result<([f32; 2], [f32; 2])> {
+    let (_, setup_required) = startup_settings(&Paths::new()?);
+    Ok(if setup_required {
+        ([540.0, 390.0], [480.0, 350.0])
+    } else {
+        (MAIN_SIZE, MAIN_MIN_SIZE)
+    })
+}
+
 fn primary_language() -> Language {
     if let Ok(override_lang) = std::env::var("R2MML_LANGUAGE") {
         return language_code(&override_lang);
@@ -138,6 +179,7 @@ pub struct ManagerApp {
     _lock: File,
     settings: Settings,
     language: Language,
+    setup_required: bool,
     ui: UiState,
     catalog: Arc<Vec<Package>>,
     profile: ProfileState,
@@ -161,13 +203,8 @@ impl ManagerApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let paths = Paths::new()?;
         let lock = paths.lock()?;
-        let mut settings: Settings = fs::read(paths.root.join("settings.json"))
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default();
-        if settings.game_path.is_empty() && Path::new("/Applications/Risk of Rain 2.app").exists() {
-            settings.game_path = "/Applications/Risk of Rain 2.app".into();
-        }
+        crate::icon_cache::install(&cc.egui_ctx, &paths.cache)?;
+        let (settings, setup_required) = startup_settings(&paths);
         let profile = ProfileState::load(&paths.profile)?;
         let (sender, receiver) = mpsc::channel();
         let language = primary_language();
@@ -176,6 +213,7 @@ impl ManagerApp {
             _lock: lock,
             settings,
             language,
+            setup_required,
             ui: UiState::default(),
             catalog: Arc::new(Vec::new()),
             profile,
@@ -198,12 +236,93 @@ impl ManagerApp {
         if let Ok(page) = std::env::var("R2MML_PREVIEW_PAGE") {
             app.ui.set_preview_page(&page);
         }
-        app.refresh(&cc.egui_ctx, false);
+        if !app.setup_required {
+            app.refresh(&cc.egui_ctx, false);
+        }
         Ok(app)
+    }
+    fn show_setup(&mut self, ctx: &egui::Context) {
+        let mut choose_game = false;
+        let lang = self.language;
+        let background = if ctx.style().visuals.dark_mode {
+            egui::Color32::from_rgb(27, 29, 34)
+        } else {
+            egui::Color32::from_rgb(247, 248, 251)
+        };
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(background).inner_margin(28))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../assets/r2mml-icon.png"))
+                                .fit_to_exact_size(egui::Vec2::splat(68.0)),
+                        );
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("R2MML").size(26.0).strong());
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new(text(
+                                lang,
+                                "Выберите игру",
+                                "Choose your game",
+                            ))
+                            .size(20.0)
+                            .strong(),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(text(
+                            lang,
+                            "Укажите приложение Risk of Rain 2.app, собранное с помощью Risk2Mac.",
+                            "Select Risk of Rain 2.app built with Risk2Mac.",
+                        ));
+                        ui.add_space(20.0);
+                        choose_game = ui
+                            .add_sized(
+                                [280.0, 42.0],
+                                egui::Button::new(
+                                    egui::RichText::new(text(
+                                        lang,
+                                        "Выбрать приложение…",
+                                        "Choose application…",
+                                    ))
+                                    .size(14.0)
+                                    .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(0, 122, 255))
+                                .corner_radius(10),
+                            )
+                            .clicked();
+                        if let Some(error) = &self.error {
+                            ui.add_space(14.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 86, 70),
+                                text(
+                                    lang,
+                                    "Не удалось выбрать игру. Проверьте приложение и попробуйте снова.",
+                                    "Couldn't select this game. Check the application and try again.",
+                                ),
+                            );
+                            ui.label(egui::RichText::new(error).small().weak());
+                        }
+                    });
+                });
+            });
+        if choose_game {
+            if let Err(error) = self.action(UiAction::ChooseGame, ctx) {
+                self.fail(format!("{error:#}"));
+            }
+        }
     }
     fn refresh(&mut self, ctx: &egui::Context, force: bool) {
         if self.busy {
             return;
+        }
+        if force {
+            // Retry failed image requests after connectivity returns. egui
+            // clears bytes/images/textures; our durable icon files remain.
+            ctx.forget_all_images();
         }
         self.busy = true;
         self.error = None;
@@ -239,10 +358,10 @@ impl ManagerApp {
                     .add_filter("macOS application", &["app"])
                     .pick_file()
                 {
-                    self.save_game(path.to_string_lossy().into_owned())?;
+                    self.save_game(path.to_string_lossy().into_owned(), ctx)?;
                 }
             }
-            UiAction::SaveGame(path) => self.save_game(path)?,
+            UiAction::SaveGame(path) => self.save_game(path, ctx)?,
             UiAction::OpenLogs => open_path(&self.paths.root)?,
             UiAction::OpenUrl(url) => {
                 let parsed = reqwest::Url::parse(&url)?;
@@ -382,15 +501,24 @@ impl ManagerApp {
         }
         Ok(())
     }
-    fn save_game(&mut self, path: String) -> Result<()> {
+    fn save_game(&mut self, path: String, ctx: &egui::Context) -> Result<()> {
         let info = launch::validate_game(Path::new(path.trim()))?;
-        self.settings.game_path = info.app_path.to_string_lossy().into_owned();
+        let settings = Settings {
+            game_path: info.app_path.to_string_lossy().into_owned(),
+        };
         catalog::atomic_write(
             &self.paths.root.join("settings.json"),
-            &serde_json::to_vec_pretty(&self.settings)?,
+            &serde_json::to_vec_pretty(&settings)?,
         )?;
+        self.settings = settings;
         self.error = None;
         self.status = text(self.language, "Путь к игре сохранён", "Game location saved");
+        if self.setup_required {
+            self.setup_required = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MAIN_MIN_SIZE.into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(MAIN_SIZE.into()));
+            self.refresh(ctx, false);
+        }
         Ok(())
     }
     fn fail(&mut self, message: String) {
@@ -483,30 +611,34 @@ impl eframe::App for ManagerApp {
                 }
             }
         }
-        let actions = self.ui.show(
-            ctx,
-            UiData {
-                language: self.language,
-                catalog: &self.catalog,
-                installed: &self.profile.installed,
-                game_path: &self.settings.game_path,
-                status: &self.status,
-                busy: self.busy,
-                progress: None,
-                error: self.error.as_deref(),
-                readme: self.readme.as_deref(),
-                changelog: self.changelog.as_deref(),
-            },
-        );
-        for action in actions {
-            if let Err(error) = self.action(action, ctx) {
-                self.fail(format!("{error:#}"));
+        if self.setup_required {
+            self.show_setup(ctx);
+        } else {
+            let actions = self.ui.show(
+                ctx,
+                UiData {
+                    language: self.language,
+                    catalog: &self.catalog,
+                    installed: &self.profile.installed,
+                    game_path: &self.settings.game_path,
+                    status: &self.status,
+                    busy: self.busy,
+                    progress: None,
+                    error: self.error.as_deref(),
+                    readme: self.readme.as_deref(),
+                    changelog: self.changelog.as_deref(),
+                },
+            );
+            for action in actions {
+                if let Err(error) = self.action(action, ctx) {
+                    self.fail(format!("{error:#}"));
+                }
             }
         }
         #[cfg(debug_assertions)]
         if let Some(path) = self.screenshot.clone() {
             if !self.screenshot_requested
-                && !self.catalog.is_empty()
+                && (self.setup_required || !self.catalog.is_empty())
                 && self.created.elapsed().as_secs() > 12
             {
                 self.screenshot_requested = true;
@@ -604,6 +736,70 @@ pub fn run_cli() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn game_fixture(root: &Path, name: &str) -> PathBuf {
+        let game = root.join(format!("{name}.app"));
+        let contents = game.join("Contents");
+        let managed = contents.join("Resources/Data/Managed");
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(contents.join("MacOS")).unwrap();
+        for name in [
+            "RoR2.dll",
+            "RoR2Arm64.ManagedSolo.dll",
+            "RoR2Arm64.OfflinePlatform.dll",
+        ] {
+            fs::write(managed.join(name), []).unwrap();
+        }
+        fs::write(
+            contents.join("MacOS/Risk of Rain 2 Player"),
+            b"\xcf\xfa\xed\xfe\x07\x00\x00\x01",
+        )
+        .unwrap();
+        let mut info = plist::Dictionary::new();
+        info.insert("CFBundleExecutable".into(), "Risk of Rain 2 Player".into());
+        plist::Value::Dictionary(info)
+            .to_file_xml(contents.join("Info.plist"))
+            .unwrap();
+        game
+    }
+
+    #[test]
+    fn saved_external_game_takes_precedence_over_applications() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = game_fixture(temp.path(), "External game");
+        let applications = game_fixture(temp.path(), "Applications game");
+        assert_eq!(
+            resolve_game_path(&saved.to_string_lossy(), &applications),
+            Some(saved.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_or_missing_saved_game_falls_back_to_applications() {
+        let temp = tempfile::tempdir().unwrap();
+        let applications = game_fixture(temp.path(), "Risk of Rain 2");
+        let invalid = temp.path().join("Unrelated.app");
+        fs::create_dir(&invalid).unwrap();
+        for saved in [String::new(), invalid.to_string_lossy().into_owned()] {
+            assert_eq!(
+                resolve_game_path(&saved, &applications),
+                Some(applications.canonicalize().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_app_and_missing_paths_require_game_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let invalid = temp.path().join("Unrelated.app");
+        fs::create_dir(&invalid).unwrap();
+        assert_eq!(resolve_game_path("", &invalid), None);
+        assert_eq!(
+            resolve_game_path(&invalid.to_string_lossy(), &temp.path().join("Missing.app")),
+            None
+        );
+    }
+
     #[test]
     fn only_primary_russian_selects_russian() {
         assert!(matches!(language_code("ru-US"), Language::Ru));

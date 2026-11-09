@@ -78,6 +78,8 @@ pub struct UiState {
     game_path_edit: String,
     last_game_path: String,
     styled_dark: Option<bool>,
+    readme_document: crate::markdown::Document,
+    changelog_document: crate::markdown::Document,
     #[cfg(debug_assertions)]
     preview_selection: Option<bool>,
 }
@@ -96,6 +98,8 @@ impl Default for UiState {
             game_path_edit: String::new(),
             last_game_path: String::new(),
             styled_dark: None,
+            readme_document: crate::markdown::Document::default(),
+            changelog_document: crate::markdown::Document::default(),
             #[cfg(debug_assertions)]
             preview_selection: None,
         }
@@ -147,13 +151,20 @@ impl UiState {
         let mut actions = Vec::new();
         #[cfg(debug_assertions)]
         if let Some(download) = self.preview_selection {
+            let preview_package = std::env::var("R2MML_PREVIEW_PACKAGE")
+                .unwrap_or_else(|_| "KingEnderBrine-ProperSave".to_owned());
             if let Some(package) = data
                 .catalog
                 .iter()
-                .find(|p| p.full_name == "KingEnderBrine-ProperSave")
+                .find(|p| p.full_name == preview_package)
                 .or_else(|| data.catalog.first())
             {
                 self.select(package, &mut actions);
+                match std::env::var("R2MML_PREVIEW_DETAILS_TAB").as_deref() {
+                    Ok("dependencies") => self.details_tab = DetailsTab::Dependencies,
+                    Ok("changelog") => self.details_tab = DetailsTab::Changelog,
+                    _ => {}
+                }
                 if download {
                     self.download = package
                         .latest()
@@ -176,8 +187,14 @@ impl UiState {
         };
 
         egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::new().fill(sidebar_fill).inner_margin(12))
+            .frame(
+                egui::Frame::new()
+                    .fill(sidebar_fill)
+                    .inner_margin(egui::Margin::symmetric(12, 4)),
+            )
             .show(ctx, |ui| {
+                ui.spacing_mut().button_padding = Vec2::new(7.0, 2.0);
+                ui.spacing_mut().interact_size.y = 22.0;
                 if let Some(error) = data.error {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(
@@ -188,9 +205,9 @@ impl UiState {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.set_min_height(28.0);
+                    ui.set_min_height(22.0);
                     if data.busy {
-                        ui.spinner();
+                        ui.add(egui::Spinner::new().size(16.0));
                     }
                     ui.label(
                         RichText::new(if data.status.is_empty() {
@@ -198,17 +215,19 @@ impl UiState {
                         } else {
                             data.status
                         })
-                        .small(),
+                        .size(11.0),
                     );
                     if let Some(progress) = data.progress {
                         ui.add(
-                            egui::ProgressBar::new(progress.clamp(0.0, 1.0)).desired_width(140.0),
+                            egui::ProgressBar::new(progress.clamp(0.0, 1.0))
+                                .desired_width(120.0)
+                                .desired_height(8.0),
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_sized(
-                                [145.0, 28.0],
+                                [130.0, 22.0],
                                 egui::Button::new(
                                     RichText::new(lang.text("Data & logs", "Данные и журналы"))
                                         .size(11.0),
@@ -858,7 +877,7 @@ impl UiState {
             .auto_shrink([false, false])
             .show(ui, |ui| match self.details_tab {
                 DetailsTab::Overview => match data.readme {
-                    Some(text) => markdown(ui, text, actions),
+                    Some(text) => self.readme_document.show(ui, text),
                     None => {
                         ui.label(
                             RichText::new(lang.text(
@@ -870,7 +889,7 @@ impl UiState {
                     }
                 },
                 DetailsTab::Changelog => match data.changelog {
-                    Some(text) if !text.trim().is_empty() => markdown(ui, text, actions),
+                    Some(text) if !text.trim().is_empty() => self.changelog_document.show(ui, text),
                     Some(_) => {
                         ui.label(lang.text(
                             "No changelog was provided for this version.",
@@ -895,12 +914,12 @@ impl UiState {
                             "Дополнительных зависимостей нет.",
                         ));
                     }
-                    for dependency in dependencies {
-                        egui::Frame::group(ui.style())
-                            .corner_radius(8)
-                            .show(ui, |ui| {
-                                ui.label(dependency);
-                            });
+                    for (index, dependency) in dependencies.iter().enumerate() {
+                        if let Some(package) =
+                            dependency_card(ui, lang, dependency, data.catalog, actions, index == 0)
+                        {
+                            self.select(package, actions);
+                        }
                     }
                     ui.add_space(8.0);
                     ui.label(
@@ -968,13 +987,6 @@ impl UiState {
             lang.text("Interface language", "Язык интерфейса"),
             lang.text("English", "Русский")
         ));
-        ui.add_space(16.0);
-        if ui
-            .button(lang.text("Open data & logs", "Данные и журналы"))
-            .clicked()
-        {
-            actions.push(UiAction::OpenLogs);
-        }
     }
 
     fn download_dialog(
@@ -1110,6 +1122,180 @@ enum NavigationIcon {
     Folder,
     Globe,
     Gear,
+}
+
+fn dependency_card<'a>(
+    ui: &mut egui::Ui,
+    lang: Language,
+    dependency: &str,
+    catalog: &'a [Package],
+    actions: &mut Vec<UiAction>,
+    _preview_first: bool,
+) -> Option<&'a Package> {
+    let (full_name, required_version) = dependency.rsplit_once('-').unwrap_or((dependency, ""));
+    let package = catalog
+        .iter()
+        .find(|package| package.full_name == full_name);
+    let version = package.and_then(|package| {
+        package
+            .version(required_version)
+            .or_else(|| package.latest())
+    });
+    let (fallback_owner, fallback_name) = full_name.split_once('-').unwrap_or(("", full_name));
+    let name = package.map(|p| p.name.as_str()).unwrap_or(fallback_name);
+    let owner = package.map(|p| p.owner.as_str()).unwrap_or(fallback_owner);
+    let icon = version.map(|v| v.icon.as_str()).unwrap_or("");
+    let id = ui.make_persistent_id(("dependency_card", dependency));
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    #[cfg(debug_assertions)]
+    if _preview_first && std::env::var("R2MML_PREVIEW_EXPAND_DEPENDENCIES").as_deref() == Ok("1") {
+        state.set_open(true);
+    }
+    let mut open_package = false;
+    egui::Frame::group(ui.style())
+        .corner_radius(10)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            let header = ui.horizontal(|ui| {
+                mod_icon(ui, icon, name, 38.0);
+                let text_width = (ui.available_width() - 24.0).max(60.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(text_width, 38.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(text_width);
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(name.replace('_', " ")).strong().size(13.0),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(name);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{} {owner}", lang.text("by", "Автор:")))
+                                    .small()
+                                    .weak(),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+                let (arrow, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+                let center = arrow.center();
+                let points = if state.is_open() {
+                    vec![
+                        center + Vec2::new(-4.0, -2.0),
+                        center + Vec2::new(4.0, -2.0),
+                        center + Vec2::new(0.0, 3.0),
+                    ]
+                } else {
+                    vec![
+                        center + Vec2::new(-2.0, -4.0),
+                        center + Vec2::new(-2.0, 4.0),
+                        center + Vec2::new(3.0, 0.0),
+                    ]
+                };
+                ui.painter().add(egui::Shape::convex_polygon(
+                    points,
+                    ui.visuals().weak_text_color(),
+                    Stroke::NONE,
+                ));
+            });
+            if ui
+                .interact(
+                    header.response.rect,
+                    id.with("header"),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                state.toggle(ui);
+            }
+            state.show_body_unindented(ui, |ui| {
+                ui.add_space(8.0);
+                ui.separator();
+                if let Some(version) = version {
+                    ui.label(RichText::new(&version.description).size(12.0));
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "{} {required_version}",
+                        lang.text("Required version:", "Нужная версия:")
+                    ))
+                    .small()
+                    .weak(),
+                );
+                if let Some(package) = package {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}",
+                            lang.text("Updated:", "Обновлён:"),
+                            package.date_updated.split('T').next().unwrap_or("")
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    if !package.categories.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} {}",
+                                lang.text("Categories:", "Категории:"),
+                                package.categories.join(", ")
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} {}",
+                                compact_count(package.total_downloads()),
+                                lang.text("downloads", "скачиваний")
+                            ))
+                            .small(),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "· {} {}",
+                                package.rating_score.max(0),
+                                lang.text("likes", "оценок")
+                            ))
+                            .small(),
+                        );
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(version) = version {
+                            if !version.website_url.is_empty()
+                                && ui.link(lang.text("Website", "Сайт мода")).clicked()
+                            {
+                                actions.push(UiAction::OpenUrl(version.website_url.clone()));
+                            }
+                        }
+                        if !package.package_url.is_empty() && ui.link("Thunderstore").clicked() {
+                            actions.push(UiAction::OpenUrl(package.package_url.clone()));
+                        }
+                        if ui.button(lang.text("Open mod", "Открыть мод")).clicked() {
+                            open_package = true;
+                        }
+                    });
+                } else {
+                    ui.label(
+                        RichText::new(lang.text(
+                            "Refresh Catalog to load package details.",
+                            "Обновите раздел «Каталог», чтобы загрузить сведения о пакете.",
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+            });
+        });
+    if open_package { package } else { None }
 }
 
 fn navigation(
@@ -1460,53 +1646,5 @@ fn size_label(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else {
         format!("{:.0} KB", bytes as f64 / 1_024.0)
-    }
-}
-
-// A deliberately small, non-HTML README renderer. Remote markup never executes.
-fn markdown(ui: &mut egui::Ui, text: &str, actions: &mut Vec<UiAction>) {
-    let mut code = false;
-    for line in text.lines().take(1_200) {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            code = !code;
-            continue;
-        }
-        if code {
-            ui.label(RichText::new(line).monospace().size(11.0));
-            continue;
-        }
-        if trimmed.is_empty() {
-            ui.add_space(6.0);
-            continue;
-        }
-        if trimmed.starts_with('<') {
-            continue;
-        }
-        if let Some(title) = trimmed
-            .strip_prefix("### ")
-            .or_else(|| trimmed.strip_prefix("## "))
-            .or_else(|| trimmed.strip_prefix("# "))
-        {
-            ui.add_space(6.0);
-            ui.label(RichText::new(title).size(18.0).strong());
-            continue;
-        }
-        if trimmed.starts_with("![") {
-            continue;
-        }
-        if let Some(link) = trimmed.strip_prefix('[') {
-            if let Some((label, rest)) = link.split_once("](") {
-                if let Some(url) = rest.strip_suffix(')') {
-                    if url.starts_with("https://") {
-                        if ui.link(label).clicked() {
-                            actions.push(UiAction::OpenUrl(url.to_owned()));
-                        }
-                        continue;
-                    }
-                }
-            }
-        }
-        ui.label(trimmed.replace("**", "").replace("__", "").replace('`', ""));
     }
 }

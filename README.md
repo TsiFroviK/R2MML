@@ -22,7 +22,8 @@ This manager is specifically for Risk2Mac. It does not install the game or turn 
 ## Features
 
 - A macOS-inspired interface with Installed, Online, and Settings views.
-- Thunderstore search, sorting, package information, README, and version selection.
+- Thunderstore search, sorting, package information, formatted README and changelog, and version selection.
+- Package icons cached on disk between launches, and expandable dependency cards with package information.
 - Automatic dependency installation, with the selected mod version preserved.
 - Enable, disable, and remove installed mods. Required dependencies cannot accidentally be disabled or removed while still needed.
 - Separate **Start modded** and **Start vanilla** actions.
@@ -36,7 +37,7 @@ The application and its packaging tool are implemented in Rust. The interface us
 
 1. Install a working [Risk2Mac game build](https://github.com/TsiFroviK/Risk2Mac). The manager expects its `.app` layout and compatibility components.
 2. Download the macOS **DMG** from [Releases](https://github.com/TsiFroviK/R2MML/releases), open it in Finder, and drag **R2MML.app** into **Applications**. Eject the disk image after copying.
-3. Open R2MML. In **Settings**, select **Risk of Rain 2.app** if it was not detected automatically.
+3. Open R2MML. If a working game is not found in **Applications** or at your saved location, a small setup window asks you to choose **Risk of Rain 2.app**. The path is remembered; you can change it later in **Settings**.
 4. Open **Online**, select a mod, click **Download**, select a version, and install it with dependencies.
 5. Use **Start modded**. The first modded launch downloads and verifies the native macOS BepInEx runtime.
 
