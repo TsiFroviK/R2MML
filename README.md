@@ -49,7 +49,7 @@ The release is locally signed, rather than Apple-notarized. If macOS blocks its 
 
 ## Everyday use
 
-**Installed** shows the selected versions and their enabled state. Disabling or removing a mod takes effect on the next modded launch. Changes do not alter an already running game. Disable or remove dependent mods first when changing a library they require.
+**Installed** shows the selected versions and their enabled state. Disabling or removing a mod takes effect on the next modded launch. Changes do not alter an already running game. Disabling a required dependency opens a list of affected mods, including indirect dependents. Choose **Disable all** to disable the dependency and those mods together, **Disable only this mod** to keep the others enabled, or **Cancel**. Disabling only the dependency may prevent dependent mods from loading or working. A required mod cannot be uninstalled until its dependents are removed.
 
 **Online** reads the Risk of Rain 2 catalog directly from [Thunderstore](https://thunderstore.io/c/riskofrain2/). A selected mod stays at the version you choose. New dependencies use the latest active version satisfying their minimum requirement; already installed satisfactory versions are retained. Missing or conflicting dependencies produce an error instead of a partially committed mod list.
 
@@ -120,6 +120,6 @@ The Rust packaging tool builds the binaries, creates the `.app` and icon, signs 
 
 R2MML's original code and artwork are available under the [MIT license](LICENSE). Third-party libraries retain their own licenses. BepInEx and downloaded mods are separate projects and remain subject to their own licenses; they are downloaded from their upstream distribution endpoints when requested.
 
-This project is not affiliated with Gearbox, Hopoo Games, Valve, Thunderstore, or the r2modman developers. Risk of Rain 2 and related game assets are not included. Package icons and descriptions shown in the catalog are retrieved from Thunderstore at runtime.
+This project is not affiliated with Gearbox, Hopoo Games, Valve, or Thunderstore. Risk of Rain 2 and related game assets are not included. Package icons and descriptions shown in the catalog are retrieved from Thunderstore at runtime.
 
 Created by TsiFroviK with contributions from Codex.

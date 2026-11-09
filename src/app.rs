@@ -443,7 +443,28 @@ impl ManagerApp {
                 if self.busy {
                     return Ok(());
                 }
+                if !enabled {
+                    let affected = install::disable_plan(&self.profile, &package)?;
+                    if affected.len() > 1 {
+                        self.error = None;
+                        self.ui.confirm_disable(package, affected);
+                        return Ok(());
+                    }
+                }
                 self.profile = install::toggle(&self.paths.profile, &package, enabled)?;
+                self.error = None;
+                self.status = text(
+                    self.language,
+                    "Изменение применится при следующем запуске",
+                    "Change applies at the next launch",
+                );
+            }
+            UiAction::Disable { package, mode } => {
+                if self.busy {
+                    return Ok(());
+                }
+                self.profile = install::disable(&self.paths.profile, &package, mode)?;
+                self.error = None;
                 self.status = text(
                     self.language,
                     "Изменение применится при следующем запуске",

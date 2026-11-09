@@ -35,6 +35,11 @@ pub struct InstalledMod {
 pub struct ProfileState {
     #[serde(default)]
     pub installed: Vec<InstalledMod>,
+    /// Dependencies the user explicitly chose to leave disabled while their
+    /// dependents remain enabled. Missing files and incompatible versions are
+    /// still errors; this only records the user's enabled-state choice.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub disabled_dependency_overrides: BTreeSet<String>,
 }
 
 impl ProfileState {
@@ -50,6 +55,12 @@ impl ProfileState {
             Version::parse(&package.version)?;
             if !names.insert(&package.full_name) {
                 bail!("Duplicate installed package: {}", package.full_name);
+            }
+        }
+        for name in &state.disabled_dependency_overrides {
+            validate_component(name)?;
+            if !state.installed.iter().any(|p| p.full_name == *name && !p.enabled) {
+                bail!("Disabled dependency override does not name a disabled installed mod: {name}");
             }
         }
         Ok(state)
@@ -125,6 +136,12 @@ pub fn plan_install(
     {
         for dep in &installed.dependencies {
             let (name, minimum) = dependency(dep)?;
+            // An unrelated installation must not silently undo a confirmed
+            // "disable only" choice. New packages' own requirements below
+            // still install and enable the dependencies they need.
+            if state.disabled_dependency_overrides.contains(&name) {
+                continue;
+            }
             requirements
                 .entry(name)
                 .and_modify(|v| *v = v.clone().max(minimum.clone()))
@@ -359,6 +376,7 @@ pub fn install(
         state
             .installed
             .retain(|p| p.full_name != installed.full_name);
+        state.disabled_dependency_overrides.remove(&installed.full_name);
         state.installed.push(installed);
     }
     state
@@ -376,8 +394,11 @@ fn validate_enabled_dependencies(state: &ProfileState) -> Result<()> {
             let installed = state
                 .installed
                 .iter()
-                .find(|p| p.full_name == name && p.enabled)
+                .find(|p| p.full_name == name)
                 .with_context(|| format!("{} requires enabled dependency {name}", package.name))?;
+            if !installed.enabled && !state.disabled_dependency_overrides.contains(&name) {
+                bail!("{} requires enabled dependency {name}", package.name);
+            }
             if Version::parse(&installed.version)? < required {
                 bail!("{} requires {name} {required}", package.name);
             }
@@ -394,6 +415,64 @@ pub fn toggle(profile: &Path, full_name: &str, enabled: bool) -> Result<ProfileS
         .find(|p| p.full_name == full_name)
         .context("Mod is not installed")?;
     package.enabled = enabled;
+    state.disabled_dependency_overrides.remove(full_name);
+    validate_enabled_dependencies(&state)?;
+    state.save(profile)?;
+    Ok(state)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisableMode {
+    AllDependents,
+    OnlySelected,
+}
+
+/// The selected mod followed by its enabled reverse-dependency closure.
+/// Disabled dependents do not participate, and each mod appears once even
+/// when metadata contains cycles or shared dependencies.
+pub fn disable_plan(state: &ProfileState, full_name: &str) -> Result<Vec<String>> {
+    if !state.installed.iter().any(|p| p.full_name == full_name) {
+        bail!("Mod is not installed");
+    }
+    let mut reverse: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for package in state.installed.iter().filter(|p| p.enabled) {
+        for reference in &package.dependencies {
+            let (name, _) = dependency(reference)?;
+            reverse.entry(name).or_default().insert(package.full_name.clone());
+        }
+    }
+    let mut affected = BTreeSet::from([full_name.to_owned()]);
+    let mut queue = VecDeque::from([full_name.to_owned()]);
+    while let Some(name) = queue.pop_front() {
+        if let Some(dependents) = reverse.get(&name) {
+            for dependent in dependents {
+                if affected.insert(dependent.clone()) {
+                    queue.push_back(dependent.clone());
+                }
+            }
+        }
+    }
+    affected.remove(full_name);
+    Ok(std::iter::once(full_name.to_owned()).chain(affected).collect())
+}
+
+/// Recompute the affected mods from the current profile and commit one update.
+pub fn disable(profile: &Path, full_name: &str, mode: DisableMode) -> Result<ProfileState> {
+    let mut state = ProfileState::load(profile)?;
+    let plan = disable_plan(&state, full_name)?;
+    let affected: BTreeSet<&str> = match mode {
+        DisableMode::AllDependents => plan.iter().map(String::as_str).collect(),
+        DisableMode::OnlySelected => BTreeSet::from([full_name]),
+    };
+    for package in &mut state.installed {
+        if affected.contains(package.full_name.as_str()) {
+            package.enabled = false;
+            state.disabled_dependency_overrides.remove(&package.full_name);
+        }
+    }
+    if mode == DisableMode::OnlySelected && plan.len() > 1 {
+        state.disabled_dependency_overrides.insert(full_name.to_owned());
+    }
     validate_enabled_dependencies(&state)?;
     state.save(profile)?;
     Ok(state)
@@ -410,6 +489,7 @@ pub fn remove(profile: &Path, full_name: &str) -> Result<ProfileState> {
         bail!("Other installed mods depend on {full_name}; remove them first");
     }
     state.installed.retain(|p| p.full_name != full_name);
+    state.disabled_dependency_overrides.remove(full_name);
     state.save(profile)?;
     Ok(state)
 }
@@ -792,11 +872,160 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         state.save(dir.path()).unwrap();
         let before = fs::read(dir.path().join("profile.json")).unwrap();
+        assert!(!String::from_utf8_lossy(&before).contains("disabled_dependency_overrides"));
+        assert!(ProfileState::load(dir.path()).unwrap().disabled_dependency_overrides.is_empty());
         assert!(toggle(dir.path(), "Test-B", false).is_err());
         assert!(remove(dir.path(), "Test-B").is_err());
         assert_eq!(before, fs::read(dir.path().join("profile.json")).unwrap());
+    }
+
+    fn installed(name: &str, enabled: bool, dependencies: &[&str]) -> InstalledMod {
+        InstalledMod {
+            full_name: format!("Test-{name}"),
+            name: name.into(),
+            owner: "Test".into(),
+            version: "1.0.0".into(),
+            enabled,
+            dependencies: dependencies.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn stage_test_package(profile: &Path, name: &str) {
+        let directory = profile.join("packages").join(format!("Test-{name}-1.0.0"));
+        fs::create_dir_all(directory.join("plugins")).unwrap();
+        fs::write(directory.join(".r2mml-complete"), b"complete").unwrap();
+        fs::write(directory.join("plugins/payload.txt"), name.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn disabling_plan_includes_transitive_dependents_once_and_ignores_disabled_mods() {
+        let state = ProfileState {
+            installed: vec![
+                installed("A", true, &["Test-B-1.0.0"]),
+                installed("B", true, &["Test-C-1.0.0"]),
+                installed("C", true, &["Test-A-1.0.0"]),
+                installed("D", true, &["Test-B-1.0.0", "Test-C-1.0.0"]),
+                installed("E", false, &["Test-C-1.0.0"]),
+                installed("Unrelated", true, &[]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(disable_plan(&state, "Test-C").unwrap(), ["Test-C", "Test-A", "Test-B", "Test-D"]);
+        assert!(disable_plan(&state, "Test-Missing").is_err());
+    }
+
+    #[test]
+    fn disable_all_changes_only_enabled_reverse_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            installed: vec![
+                installed("A", true, &["Test-B-1.0.0"]),
+                installed("B", true, &["Test-C-1.0.0"]),
+                installed("C", true, &[]),
+                installed("PreviouslyDisabled", false, &["Test-C-1.0.0"]),
+                installed("Unrelated", true, &[]),
+            ],
+            ..Default::default()
+        };
+        state.save(dir.path()).unwrap();
+        let updated = disable(dir.path(), "Test-C", DisableMode::AllDependents).unwrap();
+        assert_eq!(updated.installed.iter().filter(|p| p.enabled).map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Unrelated"]);
+        assert!(updated.disabled_dependency_overrides.is_empty());
+        assert_eq!(serde_json::to_value(updated).unwrap(), serde_json::to_value(ProfileState::load(dir.path()).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn disable_only_survives_restart_and_materializes_dependents_without_disabled_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            installed: vec![installed("A", true, &["Test-B-1.0.0"]), installed("B", true, &[])],
+            ..Default::default()
+        };
+        state.save(dir.path()).unwrap();
+        stage_test_package(dir.path(), "A");
+        stage_test_package(dir.path(), "B");
+        let active = materialize(dir.path()).unwrap();
+        assert!(active.join("plugins/Test-B/payload.txt").is_file());
+        disable(dir.path(), "Test-B", DisableMode::OnlySelected).unwrap();
+        let restarted = ProfileState::load(dir.path()).unwrap();
+        assert!(restarted.installed[0].enabled);
+        assert!(!restarted.installed[1].enabled);
+        assert!(restarted.disabled_dependency_overrides.contains("Test-B"));
+        materialize(dir.path()).unwrap();
+        assert!(active.join("plugins/Test-A/payload.txt").is_file());
+        assert!(!active.join("plugins/Test-B").exists());
+        toggle(dir.path(), "Test-A", false).unwrap();
+        let reenabled = toggle(dir.path(), "Test-B", true).unwrap();
+        assert!(reenabled.disabled_dependency_overrides.is_empty());
+        toggle(dir.path(), "Test-A", true).unwrap();
+    }
+
+    #[test]
+    fn disable_all_clears_prior_only_selected_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            installed: vec![installed("A", true, &["Test-B-1.0.0"]), installed("B", true, &[])],
+            ..Default::default()
+        };
+        state.save(dir.path()).unwrap();
+        disable(dir.path(), "Test-B", DisableMode::OnlySelected).unwrap();
+        let updated = disable(dir.path(), "Test-B", DisableMode::AllDependents).unwrap();
+        assert!(updated.installed.iter().all(|p| !p.enabled));
+        assert!(updated.disabled_dependency_overrides.is_empty());
+    }
+
+    #[test]
+    fn disable_only_never_ignores_version_or_missing_dependency_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ProfileState {
+            installed: vec![installed("A", true, &["Test-B-2.0.0"]), installed("B", true, &[]), installed("Unrelated", true, &[])],
+            ..Default::default()
+        };
+        state.save(dir.path()).unwrap();
+        let before = fs::read(dir.path().join("profile.json")).unwrap();
+        assert!(disable(dir.path(), "Test-B", DisableMode::OnlySelected).is_err());
+        assert_eq!(before, fs::read(dir.path().join("profile.json")).unwrap());
+        state.installed.retain(|p| p.full_name != "Test-B");
+        state.save(dir.path()).unwrap();
+        let before = fs::read(dir.path().join("profile.json")).unwrap();
+        assert!(disable(dir.path(), "Test-Unrelated", DisableMode::OnlySelected).is_err());
+        assert_eq!(before, fs::read(dir.path().join("profile.json")).unwrap());
+    }
+
+    #[test]
+    fn unrelated_install_does_not_reenable_explicitly_disabled_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            installed: vec![installed("A", true, &["Test-B-1.0.0"]), installed("B", true, &[])],
+            ..Default::default()
+        };
+        state.save(dir.path()).unwrap();
+        disable(dir.path(), "Test-B", DisableMode::OnlySelected).unwrap();
+        let c = package("C", &[("1.0.0", &[])]);
+        let b = package("B", &[("1.0.0", &[])]);
+        let plan = plan_install(&c, "1.0.0", &[c.clone(), b.clone()], dir.path()).unwrap();
+        assert_eq!(plan.packages.len(), 1);
+        stage_test_package(dir.path(), "C");
+        let updated = install(&c, "1.0.0", &[c.clone(), b.clone()], dir.path(), &dir.path().join("cache"), |_| {}).unwrap();
+        assert!(updated.disabled_dependency_overrides.contains("Test-B"));
+        assert!(!updated.installed.iter().find(|p| p.full_name == "Test-B").unwrap().enabled);
+        // Explicitly reinstalling the overridden dependency cannot bypass an
+        // enabled mod's minimum version, and failure leaves the profile intact.
+        let downgrade = package("B", &[("0.5.0", &[])]);
+        let old_files = dir.path().join("packages/Test-B-0.5.0");
+        fs::create_dir_all(&old_files).unwrap();
+        fs::write(old_files.join(".r2mml-complete"), b"complete").unwrap();
+        let before = fs::read(dir.path().join("profile.json")).unwrap();
+        assert!(install(&downgrade, "0.5.0", &[downgrade.clone()], dir.path(), &dir.path().join("cache"), |_| {}).is_err());
+        assert_eq!(before, fs::read(dir.path().join("profile.json")).unwrap());
+        stage_test_package(dir.path(), "B");
+        let reinstalled = install(&b, "1.0.0", &[b.clone()], dir.path(), &dir.path().join("cache"), |_| {}).unwrap();
+        assert!(reinstalled.disabled_dependency_overrides.is_empty());
+        assert!(reinstalled.installed.iter().find(|p| p.full_name == "Test-B").unwrap().enabled);
     }
 }

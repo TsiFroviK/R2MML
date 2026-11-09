@@ -38,6 +38,7 @@ pub enum UiAction {
     Refresh,
     Install { package: String, version: String },
     Toggle { package: String, enabled: bool },
+    Disable { package: String, mode: crate::install::DisableMode },
     Remove { package: String },
     Launch { modded: bool },
     ChooseGame,
@@ -75,6 +76,7 @@ pub struct UiState {
     details_tab: DetailsTab,
     download: Option<(String, String)>,
     remove: Option<String>,
+    disable: Option<(String, Vec<String>)>,
     game_path_edit: String,
     last_game_path: String,
     styled_dark: Option<bool>,
@@ -82,6 +84,8 @@ pub struct UiState {
     changelog_document: crate::markdown::Document,
     #[cfg(debug_assertions)]
     preview_selection: Option<bool>,
+    #[cfg(debug_assertions)]
+    preview_disable_done: bool,
 }
 
 impl Default for UiState {
@@ -95,6 +99,7 @@ impl Default for UiState {
             details_tab: DetailsTab::Overview,
             download: None,
             remove: None,
+            disable: None,
             game_path_edit: String::new(),
             last_game_path: String::new(),
             styled_dark: None,
@@ -102,6 +107,8 @@ impl Default for UiState {
             changelog_document: crate::markdown::Document::default(),
             #[cfg(debug_assertions)]
             preview_selection: None,
+            #[cfg(debug_assertions)]
+            preview_disable_done: false,
         }
     }
 }
@@ -118,12 +125,19 @@ impl UiState {
         self.details_tab = DetailsTab::Overview;
         self.download = None;
         self.remove = None;
+        self.disable = None;
         if page != Page::Settings {
             self.search.clear();
         }
         if page == Page::Installed {
             self.category.clear();
         }
+    }
+
+    pub fn confirm_disable(&mut self, package: String, affected: Vec<String>) {
+        self.download = None;
+        self.remove = None;
+        self.disable = Some((package, affected));
     }
 
     #[cfg(debug_assertions)]
@@ -149,6 +163,19 @@ impl UiState {
             self.last_game_path = data.game_path.to_owned();
         }
         let mut actions = Vec::new();
+        #[cfg(debug_assertions)]
+        if !self.preview_disable_done && !data.installed.is_empty() {
+            self.preview_disable_done = true;
+            if let Ok(package) = std::env::var("R2MML_PREVIEW_DISABLE") {
+                let state = crate::install::ProfileState {
+                    installed: data.installed.to_vec(),
+                    ..Default::default()
+                };
+                if let Ok(affected) = crate::install::disable_plan(&state, &package) {
+                    self.confirm_disable(package, affected);
+                }
+            }
+        }
         #[cfg(debug_assertions)]
         if let Some(download) = self.preview_selection {
             let preview_package = std::env::var("R2MML_PREVIEW_PACKAGE")
@@ -358,6 +385,7 @@ impl UiState {
             });
         self.download_dialog(ctx, &data, &mut actions);
         self.remove_dialog(ctx, &data, &mut actions);
+        self.disable_dialog(ctx, &data, &mut actions);
         actions
     }
 
@@ -1090,6 +1118,95 @@ impl UiState {
         };
     }
 
+    fn disable_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        data: &UiData<'_>,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let Some((package, affected)) = self.disable.clone() else {
+            return;
+        };
+        let lang = data.language;
+        let mut close = false;
+        let width = (ctx.content_rect().width() - 64.0).clamp(260.0, 540.0);
+        let list_height = (ctx.content_rect().height().min(700.0) - 370.0).clamp(80.0, 330.0);
+        let modal = egui::Modal::new(egui::Id::new("disable_modal")).show(ctx, |ui| {
+            ui.set_width(width);
+            ui.heading(lang.text("Disable this dependency?", "Отключить зависимость?"));
+            ui.add(egui::Label::new(RichText::new(&package).strong()).truncate())
+                .on_hover_text(&package);
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(220, 158, 35).gamma_multiply(0.16))
+                .corner_radius(8)
+                .inner_margin(10)
+                .show(ui, |ui| {
+                    ui.label(lang.text(
+                        "Other enabled mods depend on this mod. Disable all to turn them off together. Disabling only this mod may prevent dependent mods from loading or cause errors.",
+                        "Другие включённые моды зависят от этого мода. Выберите «Отключить все», чтобы отключить их вместе. Если отключить только этот мод, зависимые моды могут не загрузиться или работать с ошибками.",
+                    ));
+                });
+            ui.add_space(8.0);
+            ui.label(RichText::new(format!(
+                "{} ({})",
+                lang.text("Mods to disable", "Моды для отключения"),
+                affected.len(),
+            )).strong());
+            egui::ScrollArea::vertical()
+                .id_salt("disable_affected_mods")
+                .max_height(list_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for name in &affected {
+                        let installed = data.installed.iter().find(|item| item.full_name == *name);
+                        ui.horizontal(|ui| {
+                            if let Some(item) = installed {
+                                mod_icon(ui, &item.icon, &item.name, 30.0);
+                                ui.vertical(|ui| {
+                                    ui.add(egui::Label::new(RichText::new(item.name.replace('_', " ")).strong()).truncate())
+                                        .on_hover_text(name);
+                                    ui.add(egui::Label::new(RichText::new(format!("{} · {}", item.owner, item.version)).small().weak()).truncate());
+                                });
+                            } else {
+                                ui.add(egui::Label::new(name).truncate()).on_hover_text(name);
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+            if ui.add_enabled(!data.busy, egui::Button::new(
+                RichText::new(lang.text("Disable all (recommended)", "Отключить все (рекомендуется)")).color(Color32::WHITE),
+            ).fill(BLUE).min_size(Vec2::new(width, 30.0))).clicked() {
+                actions.push(UiAction::Disable {
+                    package: package.clone(),
+                    mode: crate::install::DisableMode::AllDependents,
+                });
+                close = true;
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!data.busy, egui::Button::new(lang.text(
+                    "Disable only this mod", "Отключить только этот мод",
+                ))).clicked() {
+                    actions.push(UiAction::Disable {
+                        package: package.clone(),
+                        mode: crate::install::DisableMode::OnlySelected,
+                    });
+                    close = true;
+                }
+                if ui.button(lang.text("Cancel", "Отмена")).clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || modal.should_close() {
+            self.disable = None;
+        }
+    }
+
     fn remove_dialog(
         &mut self,
         ctx: &egui::Context,
@@ -1663,6 +1780,88 @@ fn size_label(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn disable_frame(
+        state: &mut UiState,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        lang: Language,
+        busy: bool,
+    ) -> (Vec<UiAction>, egui::FullOutput) {
+        let mut actions = Vec::new();
+        let output = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(940.0, 620.0))),
+            events,
+            ..Default::default()
+        }, |ctx| {
+            state.configure(ctx);
+            egui::CentralPanel::default().show(ctx, |_| {});
+            state.disable_dialog(ctx, &UiData {
+                language: lang, catalog: &[], installed: &[], game_path: "", status: "",
+                busy, progress: None, error: None, readme: None, changelog: None,
+            }, &mut actions);
+        });
+        (actions, output)
+    }
+
+    fn modal_button(output: &egui::FullOutput, label: &str) -> egui::Rect {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            _ => None,
+        }).unwrap_or_else(|| panic!("button label missing: {label}"))
+    }
+
+    fn modal_click(label: &str, lang: Language, busy: bool) -> (Vec<UiAction>, bool) {
+        let ctx = egui::Context::default();
+        let mut state = UiState::default();
+        state.confirm_disable("Owner-Library".into(), (0..60).map(|n| format!("Owner-Mod{n}")).collect());
+        disable_frame(&mut state, &ctx, vec![], lang, busy);
+        disable_frame(&mut state, &ctx, vec![], lang, busy);
+        disable_frame(&mut state, &ctx, vec![], lang, busy);
+        let (_, output) = disable_frame(&mut state, &ctx, vec![], lang, busy);
+        let rect = modal_button(&output, label);
+        assert!(rect.min.y >= 0.0 && rect.max.y <= 620.0, "modal actions must fit the smallest window: {rect:?}");
+        let pos = rect.center();
+        disable_frame(&mut state, &ctx, vec![egui::Event::PointerMoved(pos)], lang, busy);
+        disable_frame(&mut state, &ctx, vec![egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE,
+        }], lang, busy);
+        let (actions, _) = disable_frame(&mut state, &ctx, vec![egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE,
+        }], lang, busy);
+        (actions, state.disable.is_some())
+    }
+
+    #[test]
+    fn dependency_dialog_choices_and_cancel_are_distinct() {
+        for lang in [Language::En, Language::Ru] {
+            let (all, open) = modal_click(lang.text("Disable all (recommended)", "Отключить все (рекомендуется)"), lang, false);
+            assert!(!open);
+            assert!(matches!(&all[..], [UiAction::Disable { package, mode: crate::install::DisableMode::AllDependents }] if package == "Owner-Library"));
+            let (only, open) = modal_click(lang.text("Disable only this mod", "Отключить только этот мод"), lang, false);
+            assert!(!open);
+            assert!(matches!(&only[..], [UiAction::Disable { package, mode: crate::install::DisableMode::OnlySelected }] if package == "Owner-Library"));
+            let (cancel, open) = modal_click(lang.text("Cancel", "Отмена"), lang, false);
+            assert!(cancel.is_empty() && !open);
+        }
+    }
+
+    #[test]
+    fn dependency_dialog_busy_and_escape_never_emit_disable() {
+        let (actions, open) = modal_click("Disable all (recommended)", Language::En, true);
+        assert!(actions.is_empty() && open);
+        let ctx = egui::Context::default();
+        let mut state = UiState::default();
+        state.confirm_disable("Owner-Library".into(), vec!["Owner-Dependent".into()]);
+        disable_frame(&mut state, &ctx, vec![], Language::En, false);
+        let (actions, _) = disable_frame(&mut state, &ctx, vec![egui::Event::Key {
+            key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }], Language::En, false);
+        assert!(actions.is_empty() && state.disable.is_none());
+    }
 
     fn row_frame(
         ctx: &egui::Context,
