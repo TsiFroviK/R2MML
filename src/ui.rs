@@ -1178,16 +1178,16 @@ impl UiState {
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(4.0);
-            if ui.add_enabled(!data.busy, egui::Button::new(
-                RichText::new(lang.text("Disable all (recommended)", "Отключить все (рекомендуется)")).color(Color32::WHITE),
-            ).fill(BLUE).min_size(Vec2::new(width, 30.0))).clicked() {
-                actions.push(UiAction::Disable {
-                    package: package.clone(),
-                    mode: crate::install::DisableMode::AllDependents,
-                });
-                close = true;
-            }
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!data.busy, egui::Button::new(
+                    RichText::new(lang.text("Disable all", "Отключить все")).color(Color32::WHITE),
+                ).fill(BLUE)).on_hover_text(lang.text("Recommended", "Рекомендуется")).clicked() {
+                    actions.push(UiAction::Disable {
+                        package: package.clone(),
+                        mode: crate::install::DisableMode::AllDependents,
+                    });
+                    close = true;
+                }
                 if ui.add_enabled(!data.busy, egui::Button::new(lang.text(
                     "Disable only this mod", "Отключить только этот мод",
                 ))).clicked() {
@@ -1821,6 +1821,16 @@ mod tests {
         disable_frame(&mut state, &ctx, vec![], lang, busy);
         disable_frame(&mut state, &ctx, vec![], lang, busy);
         let (_, output) = disable_frame(&mut state, &ctx, vec![], lang, busy);
+        let buttons = [
+            modal_button(&output, lang.text("Disable all", "Отключить все")),
+            modal_button(&output, lang.text("Disable only this mod", "Отключить только этот мод")),
+            modal_button(&output, lang.text("Cancel", "Отмена")),
+        ];
+        for button in buttons {
+            assert!((button.center().y - buttons[0].center().y).abs() < 0.5, "all modal buttons must share one row");
+            assert!(button.min.x >= 0.0 && button.max.x <= 940.0 && button.min.y >= 0.0 && button.max.y <= 620.0,
+                "modal actions must fit the smallest window: {button:?}");
+        }
         let rect = modal_button(&output, label);
         assert!(rect.min.y >= 0.0 && rect.max.y <= 620.0, "modal actions must fit the smallest window: {rect:?}");
         let pos = rect.center();
@@ -1837,7 +1847,7 @@ mod tests {
     #[test]
     fn dependency_dialog_choices_and_cancel_are_distinct() {
         for lang in [Language::En, Language::Ru] {
-            let (all, open) = modal_click(lang.text("Disable all (recommended)", "Отключить все (рекомендуется)"), lang, false);
+            let (all, open) = modal_click(lang.text("Disable all", "Отключить все"), lang, false);
             assert!(!open);
             assert!(matches!(&all[..], [UiAction::Disable { package, mode: crate::install::DisableMode::AllDependents }] if package == "Owner-Library"));
             let (only, open) = modal_click(lang.text("Disable only this mod", "Отключить только этот мод"), lang, false);
@@ -1850,7 +1860,7 @@ mod tests {
 
     #[test]
     fn dependency_dialog_busy_and_escape_never_emit_disable() {
-        let (actions, open) = modal_click("Disable all (recommended)", Language::En, true);
+        let (actions, open) = modal_click("Disable all", Language::En, true);
         assert!(actions.is_empty() && open);
         let ctx = egui::Context::default();
         let mut state = UiState::default();
