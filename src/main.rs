@@ -12,9 +12,11 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let (initial_size, minimum_size) = app::initial_window_dimensions()?;
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/r2mml-icon.png"))?;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("R2MML")
+            .with_icon(icon)
             .with_app_id("io.github.tsifrovik.r2mml")
             .with_inner_size(initial_size)
             .with_min_inner_size(minimum_size),
