@@ -105,6 +105,23 @@ impl Default for UiState {
 const BLUE: Color32 = Color32::from_rgb(0, 122, 255);
 
 impl UiState {
+    fn change_page(&mut self, page: Page) {
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+        self.selected = None;
+        self.details_tab = DetailsTab::Overview;
+        self.download = None;
+        self.remove = None;
+        if page != Page::Settings {
+            self.search.clear();
+        }
+        if page == Page::Installed {
+            self.category.clear();
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub fn set_preview_page(&mut self, page: &str) {
         self.page = match page {
@@ -226,8 +243,10 @@ impl UiState {
                             .add_sized(
                                 [151.0, 38.0],
                                 egui::Button::new(
-                                    RichText::new(lang.text("▶  Play modded", "▶  Запуск с модами"))
-                                        .color(Color32::WHITE),
+                                    RichText::new(
+                                        lang.text("▶  Play modded", "▶  Запуск с модами"),
+                                    )
+                                    .color(Color32::WHITE),
                                 )
                                 .fill(BLUE)
                                 .corner_radius(9),
@@ -262,9 +281,7 @@ impl UiState {
                     Some(data.installed.len()),
                     self.page == Page::Installed,
                 ) {
-                    self.page = Page::Installed;
-                    self.search.clear();
-                    self.category.clear();
+                    self.change_page(Page::Installed);
                 }
                 if navigation(
                     ui,
@@ -273,8 +290,7 @@ impl UiState {
                     Some(data.catalog.len()),
                     self.page == Page::Online,
                 ) {
-                    self.page = Page::Online;
-                    self.search.clear();
+                    self.change_page(Page::Online);
                 }
                 ui.add_space(18.0);
                 ui.separator();
@@ -286,7 +302,7 @@ impl UiState {
                     None,
                     self.page == Page::Settings,
                 ) {
-                    self.page = Page::Settings;
+                    self.change_page(Page::Settings);
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(8.0);
@@ -599,8 +615,7 @@ impl UiState {
                     .button(lang.text("Browse Thunderstore", "Открыть каталог"))
                     .clicked()
                 {
-                    self.page = Page::Online;
-                    self.search.clear();
+                    self.change_page(Page::Online);
                 }
             }
             egui::ScrollArea::vertical()
@@ -676,23 +691,9 @@ impl UiState {
             .map(|p| p.full_name.as_str())
             .or_else(|| installed.map(|p| p.full_name.as_str()))
             == Some("bbepis-BepInExPack");
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(lang.text("MOD DETAILS", "О МОДЕ"))
-                    .small()
-                    .weak(),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("×")
-                    .on_hover_text(lang.text("Close details", "Закрыть описание"))
-                    .clicked()
-                {
-                    self.selected = None;
-                }
-            });
-        });
-        ui.add_space(12.0);
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        ui.spacing_mut().button_padding = Vec2::new(8.0, 5.0);
+        ui.spacing_mut().interact_size.y = 26.0;
         let version = package.and_then(|p| {
             if self.page == Page::Installed {
                 installed
@@ -714,35 +715,57 @@ impl UiState {
             .map(|v| v.icon.as_str())
             .or_else(|| installed.map(|p| p.icon.as_str()))
             .unwrap_or("");
-        mod_icon(ui, icon, name, 62.0);
-        ui.add_space(9.0);
-        ui.label(RichText::new(name.replace('_', " ")).size(25.0).strong());
-        ui.label(RichText::new(format!("{} {}", lang.text("by", "Автор:"), owner)).weak());
-        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            mod_icon(ui, icon, name, 40.0);
+            let text_width = (ui.available_width() - 32.0).max(0.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(text_width, 40.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_width(text_width);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.add(
+                        egui::Label::new(RichText::new(name.replace('_', " ")).size(19.0).strong())
+                            .truncate(),
+                    )
+                    .on_hover_text(name);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("{} {}", lang.text("by", "Автор:"), owner))
+                                .size(11.0)
+                                .weak(),
+                        )
+                        .truncate(),
+                    );
+                },
+            );
+            if ui
+                .add_sized([26.0, 26.0], egui::Button::new("×"))
+                .on_hover_text(lang.text("Close details", "Закрыть описание"))
+                .clicked()
+            {
+                self.selected = None;
+            }
+        });
+        ui.add_space(4.0);
         if let Some(version) = version {
-            ui.label(&version.description);
-            ui.add_space(10.0);
+            compact_description(ui, &version.description);
             if let Some(package) = package {
-                ui.horizontal(|ui| {
-                    metric(
-                        ui,
-                        &compact_count(package.total_downloads()),
-                        lang.text("Downloads", "Скачивания"),
-                    );
-                    ui.separator();
-                    metric(
-                        ui,
-                        &version.version_number,
+                ui.label(
+                    RichText::new(format!(
+                        "{} {} · {} {}",
+                        compact_count(package.total_downloads()),
+                        lang.text("downloads", "скачиваний"),
                         if runtime_package && self.page == Page::Installed {
-                            lang.text("Dependency version", "Версия зависимости")
-                        } else if self.page == Page::Installed {
-                            lang.text("Installed version", "Установленная версия")
+                            lang.text("dependency", "зависимость")
                         } else {
-                            lang.text("Latest version", "Последняя версия")
+                            lang.text("version", "версия")
                         },
-                    );
-                });
-                ui.add_space(10.0);
+                        version.version_number,
+                    ))
+                    .size(11.0)
+                    .weak(),
+                );
                 ui.label(
                     RichText::new(format!(
                         "{} {}",
@@ -758,78 +781,60 @@ impl UiState {
                 );
             }
         } else if let Some(installed) = installed {
-            ui.label(&installed.description);
+            compact_description(ui, &installed.description);
         }
         if runtime_package {
-            ui.add_space(12.0);
-            egui::Frame::group(ui.style())
-                .corner_radius(9)
-                .show(ui, |ui| {
-                    ui.label(RichText::new(format!("BepInEx {RUNTIME_VERSION} · macOS")).strong());
-                    ui.label(
-                        RichText::new(lang.text(
-                            "R2MML provides this dependency with the native macOS runtime.",
-                            "R2MML предоставляет эту зависимость через нативную среду macOS.",
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                    if let Some(item) = installed {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} {}",
-                                lang.text("Dependency version:", "Версия зависимости:"),
-                                item.version
-                            ))
-                            .small(),
-                        );
-                    }
-                });
+            ui.label(
+                RichText::new(format!("BepInEx {RUNTIME_VERSION} · macOS"))
+                    .size(11.0)
+                    .strong(),
+            )
+            .on_hover_text(lang.text(
+                "R2MML provides this dependency with the native macOS runtime.",
+                "R2MML предоставляет эту зависимость через нативную среду macOS.",
+            ));
         }
-        ui.add_space(15.0);
+        ui.add_space(4.0);
         ui.add_enabled_ui(!data.busy, |ui| {
-            if let Some(package) = package {
-                if let Some(version) = version {
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 38.0],
-                            egui::Button::new(
-                                RichText::new(if installed.is_some() {
-                                    lang.text("Change version…", "Выбрать версию…")
-                                } else {
-                                    lang.text("Download…", "Скачать…")
-                                })
-                                .color(Color32::WHITE),
+            ui.horizontal_wrapped(|ui| {
+                if let Some(package) = package {
+                    if let Some(version) = version {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(if installed.is_some() {
+                                        lang.text("Change version…", "Выбрать версию…")
+                                    } else {
+                                        lang.text("Download…", "Скачать…")
+                                    })
+                                    .color(Color32::WHITE),
+                                )
+                                .fill(BLUE),
                             )
-                            .fill(BLUE),
+                            .clicked()
+                        {
+                            self.download =
+                                Some((package.full_name.clone(), version.version_number.clone()));
+                        }
+                    }
+                    if ui.link("Thunderstore ↗").clicked() {
+                        actions.push(UiAction::OpenUrl(package.package_url.clone()));
+                    }
+                }
+                if let Some(item) = installed {
+                    if ui
+                        .button(
+                            RichText::new(lang.text("Uninstall", "Удалить"))
+                                .color(Color32::from_rgb(230, 86, 70)),
                         )
                         .clicked()
                     {
-                        self.download =
-                            Some((package.full_name.clone(), version.version_number.clone()));
+                        self.remove = Some(item.full_name.clone());
                     }
                 }
-                if ui
-                    .button(lang.text("View on Thunderstore ↗", "Открыть в Thunderstore ↗"))
-                    .clicked()
-                {
-                    actions.push(UiAction::OpenUrl(package.package_url.clone()));
-                }
-            }
-            if let Some(item) = installed {
-                ui.add_space(4.0);
-                if ui
-                    .button(
-                        RichText::new(lang.text("Uninstall", "Удалить"))
-                            .color(Color32::from_rgb(230, 86, 70)),
-                    )
-                    .clicked()
-                {
-                    self.remove = Some(item.full_name.clone());
-                }
-            }
+            });
         });
-        ui.add_space(18.0);
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.details_tab, DetailsTab::Overview, "README");
             ui.selectable_value(
@@ -1421,11 +1426,23 @@ fn empty(ui: &mut egui::Ui, _lang: Language, title: &str, description: &str) {
     ui.add_space(16.0);
 }
 
-fn metric(ui: &mut egui::Ui, number: &str, caption: &str) {
-    ui.vertical(|ui| {
-        ui.label(RichText::new(number).size(18.0).strong());
-        ui.label(RichText::new(caption).small().weak());
-    });
+fn compact_description(ui: &mut egui::Ui, description: &str) {
+    if description.is_empty() {
+        return;
+    }
+    let mut job = egui::text::LayoutJob::simple(
+        description.to_owned(),
+        FontId::proportional(12.0),
+        ui.visuals().text_color(),
+        ui.available_width(),
+    );
+    job.wrap.max_rows = 3;
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    let truncated = galley.elided;
+    let response = ui.add(egui::Label::new(galley));
+    if truncated {
+        response.on_hover_text(description);
+    }
 }
 
 fn compact_count(count: u64) -> String {
