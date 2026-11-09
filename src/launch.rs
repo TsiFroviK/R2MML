@@ -300,7 +300,7 @@ fn assert_external_profile(profile: &Path, game: &Path) -> Result<PathBuf> {
         !resolved.starts_with(game),
         "The mod profile must be outside the game application"
     );
-    for name in ["BepInEx", "BepInEx/core", "logs"] {
+    for name in ["BepInEx", "BepInEx/core", "BepInEx/config", "logs"] {
         let target = resolved.join(name);
         ensure!(
             !target.is_symlink(),
@@ -329,6 +329,101 @@ fn copy_runtime_core(runtime: &Path, profile: &Path) -> Result<()> {
         fs::copy(entry.path(), destination)?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+const ROR2_ENTRYPOINT: &str =
+    "[Preloader.Entrypoint]\nAssembly = RoR2.dll\nType = Console\nMethod = .cctor\n";
+
+#[cfg(any(target_os = "macos", test))]
+fn configure_chainloader(bepinex: &Path) -> Result<()> {
+    let path = bepinex.join("config/BepInEx.cfg");
+    let updated = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file(),
+                "BepInEx config must be a regular file: {}",
+                path.display()
+            );
+            let bytes = fs::read(&path).context("Could not read the BepInEx config")?;
+            let Ok(config) = std::str::from_utf8(&bytes) else {
+                return Ok(());
+            };
+            migrate_stock_entrypoint(config)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(ROR2_ENTRYPOINT.to_owned())
+        }
+        Err(error) => return Err(error).context("Could not inspect the BepInEx config"),
+    };
+    if let Some(config) = updated {
+        crate::catalog::atomic_write(&path, config.as_bytes())
+            .context("Could not update the BepInEx chainloader entrypoint")?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn migrate_stock_entrypoint(config: &str) -> Option<String> {
+    const STOCK: [(&str, &str, &str); 3] = [
+        ("Assembly", "UnityEngine.CoreModule.dll", "RoR2.dll"),
+        ("Type", "Application", "Console"),
+        ("Method", ".cctor", ".cctor"),
+    ];
+    let mut updated = String::with_capacity(config.len());
+    let mut found_section = false;
+    let mut in_entrypoint = false;
+    let mut seen_keys = [false; STOCK.len()];
+
+    for (index, line) in config.split_inclusive('\n').enumerate() {
+        if line.strip_suffix("\r\n").unwrap_or(line).contains('\r') {
+            // Preserve legacy CR-only files without guessing at their sections.
+            return None;
+        }
+        let header = if index == 0 {
+            line.trim_start_matches('\u{feff}').trim()
+        } else {
+            line.trim()
+        };
+        if header.starts_with('[') && header.ends_with(']') {
+            in_entrypoint = header == "[Preloader.Entrypoint]";
+            if in_entrypoint && std::mem::replace(&mut found_section, true) {
+                return None;
+            }
+        } else if in_entrypoint
+            && let Some((key, value)) = line.split_once('=')
+            && let Some(index) = STOCK.iter().position(|(name, _, _)| *name == key.trim())
+        {
+            let (_, stock, replacement) = STOCK[index];
+            if value.trim() != stock || std::mem::replace(&mut seen_keys[index], true) {
+                return None;
+            }
+            let start = line.len() - value.trim_start().len();
+            updated.push_str(&line[..start]);
+            updated.push_str(replacement);
+            updated.push_str(&line[start + stock.len()..]);
+            continue;
+        }
+        updated.push_str(line);
+    }
+
+    if found_section {
+        return seen_keys.into_iter().all(|seen| seen).then_some(updated);
+    }
+    // No explicit entrypoint means the stock BepInEx default is in use.
+    let newline = if config.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    if !config.is_empty() {
+        if !config.ends_with('\n') {
+            updated.push_str(newline);
+        }
+        updated.push_str(newline);
+    }
+    updated.push_str(&ROR2_ENTRYPOINT.replace('\n', newline));
+    Some(updated)
 }
 
 fn clean_loader_environment(command: &mut Command) {
@@ -396,13 +491,18 @@ pub fn launch_game(game: &Path, profile: &Path, runtime: &Path, modded: bool) ->
             runtime.join("libdoorstop.dylib").is_file(),
             "Prepare the macOS runtime before launching"
         );
-        crate::install::materialize(&profile)?;
+        let active = crate::install::materialize(&profile)?;
+        let expects_plugins = contains_plugin_dll(&active.join("plugins"))?;
+        // Risk of Thunder's entrypoint avoids losing the loader when a
+        // patcher resolves UnityEngine.CoreModule before BepInEx can load its edits.
+        configure_chainloader(&active)?;
         copy_runtime_core(runtime, &profile)?;
         let logs = profile.join("logs");
         fs::create_dir_all(&logs)?;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let unity_log = logs.join(format!("Unity-{stamp}.log"));
-        let mut launcher_log = File::create(logs.join(format!("Launcher-{stamp}.log")))?;
+        let launcher_path = logs.join(format!("Launcher-{stamp}.log"));
+        let mut launcher_log = File::create_new(&launcher_path)?;
         writeln!(
             launcher_log,
             "R2MML modded launch\nGame: {}\nProfile: {}\nArchitecture: {}\nBepInEx: {}",
@@ -443,11 +543,198 @@ pub fn launch_game(game: &Path, profile: &Path, runtime: &Path, modded: bool) ->
             .stdout(Stdio::from(launcher_log.try_clone()?))
             .stderr(Stdio::from(launcher_log))
             .process_group(0);
-        Ok(command
+        let mut child = command
             .spawn()
-            .context("Could not start the modded game")?
-            .id())
+            .context("Could not start the modded game")
+            .map_err(|error| startup_error(error, &launcher_path, &unity_log))?;
+        if let Err(mut error) = wait_for_modded_startup(&mut child, &unity_log, expects_plugins) {
+            if let Err(stop_error) = child.kill()
+                && !child.try_wait().is_ok_and(|status| status.is_some())
+            {
+                error = error.context(format!("Could not stop the failed game: {stop_error}"));
+            } else {
+                let _ = child.wait();
+            }
+            return Err(startup_error(error, &launcher_path, &unity_log));
+        }
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(pid)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn contains_plugin_dll(directory: &Path) -> Result<bool> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+        {
+            return Ok(true);
+        }
+        if file_type.is_dir() && contains_plugin_dll(&path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct StartupLog {
+    pending: Vec<u8>,
+    loader_failure: Option<String>,
+    complete: bool,
+    reached_menu: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl StartupLog {
+    fn read(&mut self, bytes: &[u8], expects_plugins: bool) {
+        // Retain the start of a partial line across reads. Cap it so a noisy
+        // plugin cannot grow the manager's startup buffer indefinitely.
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let count = part.len().min(2048 - self.pending.len());
+            self.pending.extend_from_slice(&part[..count]);
+            if part.ends_with(b"\n") {
+                let line = std::mem::take(&mut self.pending);
+                self.observe_line(String::from_utf8_lossy(&line).trim(), expects_plugins);
+                self.pending = line;
+                self.pending.clear();
+            }
+        }
+    }
+
+    fn observe_line(&mut self, line: &str, expects_plugins: bool) {
+        if self.complete {
+            return;
+        }
+        self.reached_menu |= line == "BaseMainMenuScreen: OnEnter()";
+        let Some((header, message)) = line.strip_prefix('[').and_then(|line| line.split_once(']'))
+        else {
+            return;
+        };
+        let Some((level, source)) = header.split_once(':') else {
+            return;
+        };
+        let source = source.trim();
+        if !matches!(source, "BepInEx" | "Preloader") {
+            return;
+        }
+        let mut message = message.trim_start();
+        if source == "Preloader"
+            && let Some((header, nested)) = message.split_once(']')
+            && header.starts_with('[')
+            && header.ends_with("BepInEx")
+        {
+            // Preloader events can be replayed with their original log prefix.
+            message = nested.trim_start();
+        }
+        self.complete = source == "BepInEx" && message == "Chainloader startup complete";
+        let skipped = message.starts_with("Skipping [")
+            && (message.contains("because it has a dependency that was not loaded")
+                || message.contains("because of process filters"));
+        if level.trim() == "Fatal"
+            || message.starts_with("Could not load [")
+            || message.starts_with("Error loading [")
+            || message.starts_with("Failed to load patcher [")
+            || message.starts_with("Failed to run Initializer of ")
+            || message.starts_with("Failed to run Finalizer of ")
+            || (message.starts_with("Failed to run [") && message.contains("] when patching ["))
+            || skipped
+            || (expects_plugins && message == "0 plugins to load")
+        {
+            self.loader_failure.get_or_insert_with(|| line.to_owned());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_modded_startup(
+    child: &mut std::process::Child,
+    unity_log: &Path,
+    expects_plugins: bool,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut log = None;
+    let mut startup = StartupLog::default();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        if log.is_none() {
+            match File::open(unity_log) {
+                Ok(file) => log = Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("Could not open the Unity startup log"),
+            }
+        }
+        let count = match &mut log {
+            Some(file) => file
+                .read(&mut buffer)
+                .context("Could not read the Unity startup log")?,
+            None => 0,
+        };
+        startup.read(&buffer[..count], expects_plugins);
+
+        let status = child
+            .try_wait()
+            .context("Could not check the game process")?;
+        if let Some(failure) = &startup.loader_failure {
+            bail!("BepInEx could not load the mod profile:\n{failure}");
+        }
+        if let Some(status) = status {
+            bail!("The game exited during modded startup ({status})");
+        }
+        if startup.complete {
+            return Ok(());
+        }
+        ensure!(
+            !startup.reached_menu,
+            "The game reached the main menu without initializing BepInEx"
+        );
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "Timed out waiting for BepInEx to finish startup"
+        );
+        if count < buffer.len() {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn startup_error(error: anyhow::Error, launcher: &Path, unity: &Path) -> anyhow::Error {
+    use std::io::{Seek, SeekFrom};
+
+    let mut report = format!("{error:#}");
+    for path in [launcher, unity] {
+        use std::fmt::Write as _;
+
+        let _ = write!(report, "\n\n{}\n", path.display());
+        let tail = (|| -> std::io::Result<Vec<u8>> {
+            let mut file = File::open(path)?;
+            let size = file.metadata()?.len();
+            file.seek(SeekFrom::Start(size.saturating_sub(8192)))?;
+            let mut tail = Vec::new();
+            file.take(8192).read_to_end(&mut tail)?;
+            Ok(tail)
+        })();
+        match tail {
+            Ok(tail) => report.push_str(String::from_utf8_lossy(&tail).trim()),
+            Err(error) => {
+                let _ = write!(report, "Log unavailable: {error}");
+            }
+        }
+    }
+    if let Ok(mut file) = OpenOptions::new().append(true).open(launcher) {
+        let _ = writeln!(file, "\nR2MML: {error:#}");
+    }
+    anyhow::anyhow!(report)
 }
 
 #[cfg(target_os = "macos")]
@@ -523,6 +810,110 @@ fn configure_steam_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeds_ror2_chainloader_config_when_missing() {
+        let profile = tempfile::tempdir().unwrap();
+        configure_chainloader(profile.path()).unwrap();
+        let config = profile.path().join("config/BepInEx.cfg");
+        assert_eq!(fs::read_to_string(config).unwrap(), ROR2_ENTRYPOINT);
+        assert!(migrate_stock_entrypoint(ROR2_ENTRYPOINT).is_none());
+    }
+
+    #[test]
+    fn migrates_stock_entrypoint_preserving_other_settings_and_formatting() {
+        let stock = "\u{feff}[Logging.Console]\r\nEnabled = true\r\n\r\n[Preloader.Entrypoint]\r\n# Explanation\r\n  Type  =  Application\t \r\nMethod = .cctor\r\nAssembly=UnityEngine.CoreModule.dll\r\n\r\n[Other]\r\nType=Application";
+        let expected = "\u{feff}[Logging.Console]\r\nEnabled = true\r\n\r\n[Preloader.Entrypoint]\r\n# Explanation\r\n  Type  =  Console\t \r\nMethod = .cctor\r\nAssembly=RoR2.dll\r\n\r\n[Other]\r\nType=Application";
+        assert_eq!(migrate_stock_entrypoint(stock).as_deref(), Some(expected));
+        assert_eq!(
+            migrate_stock_entrypoint("[Logging.Console]\r\nEnabled = true"),
+            Some(format!(
+                "[Logging.Console]\r\nEnabled = true\r\n\r\n{}",
+                ROR2_ENTRYPOINT.replace('\n', "\r\n")
+            ))
+        );
+    }
+
+    #[test]
+    fn leaves_custom_incomplete_and_duplicate_entrypoints_untouched() {
+        for config in [
+            "[Preloader.Entrypoint]\nAssembly=UnityEngine.CoreModule.dll\nType=Application\nMethod=CustomMethod\n",
+            "[Preloader.Entrypoint]\nAssembly=UnityEngine.CoreModule.dll\nType=Application\n",
+            "[Preloader.Entrypoint]\nAssembly=UnityEngine.CoreModule.dll\nType=Application\nMethod=.cctor\n[Preloader.Entrypoint]\nType=CustomType\n",
+            "[Preloader.Entrypoint]\nAssembly=UnityEngine.CoreModule.dll\nType=Application\nMethod=.cctor\nAssembly=UnityEngine.CoreModule.dll\n",
+            "[Preloader.Entrypoint]\rAssembly=SomeOther.dll\rType=Other\rMethod=.cctor\r",
+        ] {
+            assert!(migrate_stock_entrypoint(config).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_replace_a_symlinked_bepinex_config() {
+        let profile = tempfile::tempdir().unwrap();
+        let config_dir = profile.path().join("config");
+        fs::create_dir(&config_dir).unwrap();
+        let destination = profile.path().join("external.cfg");
+        fs::write(&destination, "[Custom]\nEnabled = true\n").unwrap();
+        std::os::unix::fs::symlink(&destination, config_dir.join("BepInEx.cfg")).unwrap();
+        assert!(configure_chainloader(profile.path()).is_err());
+        assert_eq!(
+            fs::read_to_string(destination).unwrap(),
+            "[Custom]\nEnabled = true\n"
+        );
+    }
+
+    #[test]
+    fn accepts_current_launch_completion_without_treating_unrelated_errors_as_loader_failures() {
+        let mut startup = StartupLog::default();
+        startup.read(
+            b"[Error  : Unity Log] a missing shader\n[Warning:   BepInEx] Skipping [A 1.0.0] because a newer version exists (A 2.0.0)\n[Info   :   BepInEx] Loading [Proper Save 3.1.3]\n[Message:   BepInEx] Chainloader startup ",
+            true,
+        );
+        assert!(!startup.complete);
+        startup.read(b"complete\n", true);
+        assert!(startup.complete);
+        assert!(startup.loader_failure.is_none());
+    }
+
+    #[test]
+    fn distinguishes_unmodded_menu_and_rejected_plugins_from_success() {
+        let mut missing_loader = StartupLog::default();
+        missing_loader.read(b"BaseMainMenuScreen: OnEnter()\n", true);
+        assert!(missing_loader.reached_menu && !missing_loader.complete);
+
+        let mut missing_dependency = StartupLog::default();
+        missing_dependency.read(
+            b"[Error  :   BepInEx] Could not load [R2API 5.3.0] because it has missing dependencies: ___riskofthunder.RoR2BepInExPack\n[Message:   BepInEx] Chainloader startup complete\n",
+            true,
+        );
+        assert!(missing_dependency.complete);
+        assert!(
+            missing_dependency
+                .loader_failure
+                .unwrap()
+                .contains("R2API 5.3.0")
+        );
+    }
+
+    #[test]
+    fn rejects_replayed_patcher_errors_and_zero_expected_plugins() {
+        let mut patcher = StartupLog::default();
+        patcher.read(
+            b"[Error  : Preloader] [Error  :   BepInEx] Failed to run [Patcher] when patching [GameAssembly].\n",
+            false,
+        );
+        assert!(patcher.loader_failure.is_some());
+
+        let log = b"[Info   :   BepInEx] 0 plugins to load\n[Message:   BepInEx] Chainloader startup complete\n";
+        for expects_plugins in [false, true] {
+            let mut startup = StartupLog::default();
+            startup.read(log, expects_plugins);
+            assert!(startup.complete);
+            assert_eq!(startup.loader_failure.is_some(), expects_plugins);
+        }
+    }
+
     #[test]
     fn recognizes_both_native_architectures() {
         let mut bytes = vec![0u8; 32];

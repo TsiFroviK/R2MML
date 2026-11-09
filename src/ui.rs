@@ -77,6 +77,7 @@ pub struct UiState {
     download: Option<(String, String)>,
     remove: Option<String>,
     disable: Option<(String, Vec<String>)>,
+    modded_launch_error: Option<String>,
     game_path_edit: String,
     last_game_path: String,
     styled_dark: Option<bool>,
@@ -100,6 +101,7 @@ impl Default for UiState {
             download: None,
             remove: None,
             disable: None,
+            modded_launch_error: None,
             game_path_edit: String::new(),
             last_game_path: String::new(),
             styled_dark: None,
@@ -138,6 +140,13 @@ impl UiState {
         self.download = None;
         self.remove = None;
         self.disable = Some((package, affected));
+    }
+
+    pub fn show_modded_launch_error(&mut self, log: String) {
+        self.download = None;
+        self.remove = None;
+        self.disable = None;
+        self.modded_launch_error = Some(log);
     }
 
     #[cfg(debug_assertions)]
@@ -386,6 +395,7 @@ impl UiState {
         self.download_dialog(ctx, &data, &mut actions);
         self.remove_dialog(ctx, &data, &mut actions);
         self.disable_dialog(ctx, &data, &mut actions);
+        self.modded_launch_error_dialog(ctx, lang, &mut actions);
         actions
     }
 
@@ -1207,6 +1217,52 @@ impl UiState {
         }
     }
 
+    fn modded_launch_error_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        lang: Language,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let Some(log) = &self.modded_launch_error else {
+            return;
+        };
+        let width = (ctx.content_rect().width() - 64.0).clamp(260.0, 680.0);
+        let log_height = (ctx.content_rect().height() - 170.0).clamp(80.0, 410.0);
+        let modal = egui::Modal::new(egui::Id::new("modded_launch_error")).show(ctx, |ui| {
+            ui.set_width(width);
+            ui.heading(lang.text("Modded launch failed", "Игра с модами не запустилась"));
+            ui.label(lang.text("Launch log", "Журнал запуска"));
+            egui::ScrollArea::vertical()
+                .max_height(log_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut log.as_str())
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(1),
+                    );
+                });
+            ui.separator();
+            let mut close = false;
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(lang.text("Copy log", "Скопировать журнал")).clicked() {
+                    ctx.copy_text(log.clone());
+                }
+                if ui.button(lang.text("Data & logs", "Данные и журналы")).clicked() {
+                    actions.push(UiAction::OpenLogs);
+                }
+                if ui.button(lang.text("Close", "Закрыть")).clicked() {
+                    close = true;
+                }
+            });
+            close
+        });
+        if modal.inner || modal.should_close() {
+            self.modded_launch_error = None;
+        }
+    }
+
     fn remove_dialog(
         &mut self,
         ctx: &egui::Context,
@@ -1811,6 +1867,63 @@ mod tests {
             }
             _ => None,
         }).unwrap_or_else(|| panic!("button label missing: {label}"))
+    }
+
+    #[test]
+    fn modded_launch_failure_displays_and_copies_the_log() {
+        let ctx = egui::Context::default();
+        let mut state = UiState::default();
+        let log = "Doorstop failed to load\nBepInEx did not start";
+        state.show_modded_launch_error(log.to_owned());
+        let frame = |state: &mut UiState, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(940.0, 620.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    state.configure(ctx);
+                    egui::CentralPanel::default().show(ctx, |_| {});
+                    state.modded_launch_error_dialog(ctx, Language::En, &mut Vec::new());
+                },
+            )
+        };
+        for _ in 0..3 {
+            frame(&mut state, vec![]);
+        }
+        let output = frame(&mut state, vec![]);
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == log)
+        }));
+        let pos = modal_button(&output, "Copy log").center();
+        frame(&mut state, vec![egui::Event::PointerMoved(pos)]);
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut state, vec![pointer(true)]);
+        let output = frame(&mut state, vec![pointer(false)]);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(copied) if copied == log)
+        }));
+        assert!(state.modded_launch_error.is_some());
+        frame(
+            &mut state,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(state.modded_launch_error.is_none());
     }
 
     fn modal_click(label: &str, lang: Language, busy: bool) -> (Vec<UiAction>, bool) {

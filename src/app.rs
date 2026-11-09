@@ -168,7 +168,10 @@ fn text(lang: Language, ru: &str, en: &str) -> String {
 enum Event {
     Catalog(Result<Vec<Package>, String>),
     Profile(Result<ProfileState, String>),
-    Launch(Result<u32, String>),
+    Launch {
+        modded: bool,
+        result: Result<u32, String>,
+    },
     Readme(String, Result<String, String>),
     Changelog(String, Result<String, String>),
     Progress(String),
@@ -487,7 +490,6 @@ impl ManagerApp {
                     return Ok(());
                 }
                 let game = PathBuf::from(&self.settings.game_path);
-                launch::validate_game(&game)?;
                 self.busy = true;
                 self.error = None;
                 self.status = if modded {
@@ -504,6 +506,7 @@ impl ManagerApp {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
                     let result = (|| -> Result<u32> {
+                        launch::validate_game(&game)?;
                         let runtime = if modded {
                             launch::ensure_runtime(&paths.cache, &|message| {
                                 let _ = sender.send(Event::Progress(message.into()));
@@ -515,7 +518,7 @@ impl ManagerApp {
                         launch::launch_game(&game, &paths.profile, &runtime, modded)
                     })()
                     .map_err(|e| format!("{e:#}"));
-                    let _ = sender.send(Event::Launch(result));
+                    let _ = sender.send(Event::Launch { modded, result });
                     ctx.request_repaint();
                 });
             }
@@ -584,12 +587,22 @@ impl eframe::App for ManagerApp {
                         Err(e) => self.fail(e),
                     }
                 }
-                Event::Launch(result) => {
+                Event::Launch { modded, result } => {
                     self.busy = false;
                     match result {
                         Ok(pid) => {
                             self.paths.log(&format!("Game launch process {pid}"));
                             self.status = text(self.language, "Игра запущена", "Game launched");
+                        }
+                        Err(e) if modded => {
+                            self.paths.log(&e);
+                            self.status = text(
+                                self.language,
+                                "Не удалось запустить игру с модами",
+                                "Modded launch failed",
+                            );
+                            self.ui.show_modded_launch_error(e);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                         }
                         Err(e) => self.fail(e),
                     }
