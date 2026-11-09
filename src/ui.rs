@@ -226,7 +226,7 @@ impl UiState {
                             .add_sized(
                                 [151.0, 38.0],
                                 egui::Button::new(
-                                    RichText::new(lang.text("▶  Play modded", "▶  С модами"))
+                                    RichText::new(lang.text("▶  Play modded", "▶  Запуск с модами"))
                                         .color(Color32::WHITE),
                                 )
                                 .fill(BLUE)
@@ -257,6 +257,7 @@ impl UiState {
                 ui.add_space(7.0);
                 if navigation(
                     ui,
+                    NavigationIcon::Folder,
                     lang.text("Installed", "Установлено"),
                     Some(data.installed.len()),
                     self.page == Page::Installed,
@@ -267,6 +268,7 @@ impl UiState {
                 }
                 if navigation(
                     ui,
+                    NavigationIcon::Globe,
                     lang.text("Online", "Каталог"),
                     Some(data.catalog.len()),
                     self.page == Page::Online,
@@ -279,6 +281,7 @@ impl UiState {
                 ui.add_space(10.0);
                 if navigation(
                     ui,
+                    NavigationIcon::Gear,
                     lang.text("Settings", "Настройки"),
                     None,
                     self.page == Page::Settings,
@@ -958,9 +961,8 @@ impl UiState {
         ui.label(format!(
             "{}: {}",
             lang.text("Interface language", "Язык интерфейса"),
-            lang.text("English · follows your Mac", "Русский · язык вашего Mac")
+            lang.text("English", "Русский")
         ));
-        ui.label(RichText::new(lang.text("Russian is used when it is the first system language; all other languages use English.", "Русский используется, если он первый язык системы; для остальных языков используется английский.")).small().weak());
         ui.add_space(16.0);
         if ui
             .button(lang.text("Open data & logs", "Данные и журналы"))
@@ -1099,7 +1101,19 @@ impl UiState {
     }
 }
 
-fn navigation(ui: &mut egui::Ui, name: &str, count: Option<usize>, selected: bool) -> bool {
+enum NavigationIcon {
+    Folder,
+    Globe,
+    Gear,
+}
+
+fn navigation(
+    ui: &mut egui::Ui,
+    icon: NavigationIcon,
+    name: &str,
+    count: Option<usize>,
+    selected: bool,
+) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), egui::Sense::click());
     response.widget_info(|| {
@@ -1128,6 +1142,16 @@ fn navigation(ui: &mut egui::Ui, name: &str, count: Option<usize>, selected: boo
             egui::StrokeKind::Inside,
         );
     }
+    navigation_icon(
+        ui.painter(),
+        egui::pos2(rect.left() + 20.0, rect.center().y),
+        icon,
+        if selected {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        },
+    );
     let mut label_right = rect.right() - 12.0;
     if let Some(count) = count {
         let color = if selected {
@@ -1157,7 +1181,7 @@ fn navigation(ui: &mut egui::Ui, name: &str, count: Option<usize>, selected: boo
         label_right = badge.left() - 10.0;
     }
     let label_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 12.0, rect.top()),
+        egui::pos2(rect.left() + 36.0, rect.top()),
         egui::pos2(label_right, rect.bottom()),
     );
     ui.painter().with_clip_rect(label_rect).text(
@@ -1168,6 +1192,63 @@ fn navigation(ui: &mut egui::Ui, name: &str, count: Option<usize>, selected: boo
         ui.visuals().text_color(),
     );
     response.clicked()
+}
+
+fn navigation_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    icon: NavigationIcon,
+    color: Color32,
+) {
+    let stroke = Stroke::new(1.3_f32, color);
+    match icon {
+        NavigationIcon::Folder => {
+            let points = [
+                (-7.0, -5.0),
+                (-2.0, -5.0),
+                (0.0, -2.5),
+                (7.0, -2.5),
+                (7.0, 5.5),
+                (-7.0, 5.5),
+            ]
+            .into_iter()
+            .map(|(x, y)| center + Vec2::new(x, y))
+            .collect();
+            painter.add(egui::Shape::closed_line(points, stroke));
+            painter.line_segment(
+                [
+                    center + Vec2::new(-7.0, -1.5),
+                    center + Vec2::new(7.0, -1.5),
+                ],
+                stroke,
+            );
+        }
+        NavigationIcon::Globe => {
+            painter.circle_stroke(center, 7.0, stroke);
+            painter.line_segment(
+                [center + Vec2::new(-7.0, 0.0), center + Vec2::new(7.0, 0.0)],
+                stroke,
+            );
+            let meridian = (0..32)
+                .map(|index| {
+                    let angle = index as f32 * std::f32::consts::TAU / 32.0;
+                    center + Vec2::new(angle.cos() * 3.0, angle.sin() * 7.0)
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(meridian, stroke));
+        }
+        NavigationIcon::Gear => {
+            let outline = (0..32)
+                .map(|index| {
+                    let angle = index as f32 * std::f32::consts::TAU / 32.0;
+                    let radius = if matches!(index % 4, 1 | 2) { 7.0 } else { 5.5 };
+                    center + Vec2::new(angle.cos() * radius, angle.sin() * radius)
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(outline, stroke));
+            painter.circle_stroke(center, 2.4, stroke);
+        }
+    }
 }
 
 fn logo(ui: &mut egui::Ui, size: f32) {
@@ -1248,11 +1329,19 @@ fn package_row(
                     ui.set_min_width((ui.available_width() - 2.0).max(100.0));
                     ui.horizontal(|ui| {
                         mod_icon(ui, icon, name, 44.0);
-                        let reserved = if enabled.is_some() { 48.0 } else { 8.0 };
+                        let reserved = if enabled.is_some() {
+                            34.0 + ui.spacing().item_spacing.x
+                        } else {
+                            0.0
+                        };
+                        let text_width = (ui.available_width() - reserved).max(0.0);
                         ui.allocate_ui_with_layout(
-                            Vec2::new((ui.available_width() - reserved).max(80.0), 44.0),
+                            Vec2::new(text_width, 44.0),
                             egui::Layout::top_down(egui::Align::LEFT),
                             |ui| {
+                                // Reserve the whole text column even for short titles so every
+                                // switch stays at the same trailing edge of its card.
+                                ui.set_width(text_width);
                                 ui.spacing_mut().item_spacing.y = 3.0;
                                 ui.add(
                                     egui::Label::new(
