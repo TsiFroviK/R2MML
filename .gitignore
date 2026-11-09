@@ -1,0 +1,9 @@
+/target/
+/dist/
+*.app/
+*.dmg
+*.zip
+*.log
+.DS_Store
+._*
+.private/
