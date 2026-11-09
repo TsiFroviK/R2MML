@@ -1491,6 +1491,7 @@ fn package_row(
     lang: Language,
 ) -> (bool, Option<bool>) {
     let mut toggle = None;
+    let mut switch_rect = None;
     let selected_fill = BLUE.gamma_multiply(if ui.visuals().dark_mode { 0.19 } else { 0.10 });
     let normal_fill = if ui.visuals().dark_mode {
         Color32::from_rgb(29, 31, 37)
@@ -1499,7 +1500,7 @@ fn package_row(
     };
     let response = ui
         .push_id(id, |ui| {
-            egui::Frame::new()
+            let frame = egui::Frame::new()
                 .fill(if selected { selected_fill } else { normal_fill })
                 .corner_radius(12)
                 .inner_margin(12)
@@ -1567,6 +1568,7 @@ fn package_row(
                                     Vec2::new(34.0, 22.0),
                                     egui::Sense::click(),
                                 );
+                                switch_rect = Some(rect);
                                 let fill = if value {
                                     BLUE
                                 } else {
@@ -1596,9 +1598,18 @@ fn package_row(
                             });
                         }
                     });
-                })
-                .response
-                .interact(egui::Sense::click())
+                });
+            // A click response over the entire frame would sit above the switch.
+            // Keep the two hit areas separate, including when the switch is disabled.
+            let mut selection_rect = frame.response.rect;
+            if let Some(rect) = switch_rect {
+                selection_rect.max.x = rect.left() - 2.0;
+            }
+            ui.interact(
+                selection_rect,
+                frame.response.id.with("select"),
+                egui::Sense::click(),
+            )
         })
         .inner;
     (response.clicked(), toggle)
@@ -1646,5 +1657,74 @@ fn size_label(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else {
         format!("{:.0} KB", bytes as f64 / 1_024.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        enabled: bool,
+        busy: bool,
+    ) -> ((bool, Option<bool>), egui::FullOutput) {
+        let mut action = (false, None);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(600.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = package_row(
+                        ui, "example", "Example", "Author", "1.0.0", "", "Description",
+                        false, None, Some(enabled), busy, Language::En,
+                    );
+                });
+            },
+        );
+        (action, output)
+    }
+
+    fn row_click(enabled: bool, busy: bool, switch: bool) -> (bool, Option<bool>) {
+        let ctx = egui::Context::default();
+        row_frame(&ctx, vec![], enabled, busy);
+        let (_, output) = row_frame(&ctx, vec![], enabled, busy);
+        let switch_rect = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Rect(rect) if rect.rect.size() == Vec2::new(34.0, 22.0) => Some(rect.rect),
+            _ => None,
+        }).expect("the row renders a switch");
+        let pos = if switch { switch_rect.center() } else { egui::pos2(100.0, switch_rect.center().y) };
+        row_frame(&ctx, vec![egui::Event::PointerMoved(pos)], enabled, busy);
+        row_frame(&ctx, vec![egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }], enabled, busy);
+        row_frame(&ctx, vec![egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }], enabled, busy).0
+    }
+
+    #[test]
+    fn installed_switch_click_changes_enabled_state_without_selecting_row() {
+        assert_eq!(row_click(true, false, true), (false, Some(false)));
+        assert_eq!(row_click(false, false, true), (false, Some(true)));
+    }
+
+    #[test]
+    fn installed_row_click_still_selects_without_toggling() {
+        assert_eq!(row_click(true, false, false), (true, None));
+    }
+
+    #[test]
+    fn busy_switch_does_not_toggle_or_select_row() {
+        assert_eq!(row_click(true, true, true), (false, None));
     }
 }
