@@ -49,7 +49,7 @@ The release is locally signed, rather than Apple-notarized. If macOS blocks its 
 
 ## Everyday use
 
-**Installed** shows the selected versions and their enabled state. Disabling or removing a mod takes effect on the next modded launch. Changes do not alter an already running game. Disabling a required dependency opens a list of affected mods, including indirect dependents. Choose **Disable all** to disable the dependency and those mods together, **Disable only this mod** to keep the others enabled, or **Cancel**. Disabling only the dependency may prevent dependent mods from loading or working. A required mod cannot be uninstalled until its dependents are removed.
+**Installed** shows the selected versions and their enabled state. Enabling a mod automatically enables all its installed dependencies, including indirect ones. Unrelated disabled mods stay disabled. Disabling or removing a mod takes effect on the next modded launch. Changes do not alter an already running game. Disabling a required dependency opens a list of affected mods, including indirect dependents. Choose **Disable all** to disable the dependency and those mods together, **Disable only this mod** to keep the others enabled, or **Cancel**. Disabling only the dependency may prevent dependent mods from loading or working. A required mod cannot be uninstalled until its dependents are removed.
 
 **Online** reads the Risk of Rain 2 catalog directly from [Thunderstore](https://thunderstore.io/c/riskofrain2/). A selected mod stays at the version you choose. New dependencies use the latest active version satisfying their minimum requirement; already installed satisfactory versions are retained. Missing or conflicting dependencies produce an error instead of a partially committed mod list.
 

@@ -409,13 +409,41 @@ fn validate_enabled_dependencies(state: &ProfileState) -> Result<()> {
 
 pub fn toggle(profile: &Path, full_name: &str, enabled: bool) -> Result<ProfileState> {
     let mut state = ProfileState::load(profile)?;
-    let package = state
+    let root = state
         .installed
-        .iter_mut()
-        .find(|p| p.full_name == full_name)
+        .iter()
+        .position(|p| p.full_name == full_name)
         .context("Mod is not installed")?;
-    package.enabled = enabled;
-    state.disabled_dependency_overrides.remove(full_name);
+    let mut affected = BTreeSet::from([root]);
+    if enabled {
+        let by_name: BTreeMap<&str, usize> = state
+            .installed
+            .iter()
+            .enumerate()
+            .map(|(index, package)| (package.full_name.as_str(), index))
+            .collect();
+        let mut queue = VecDeque::from([root]);
+        // Include enabled intermediates as well: an explicit "disable only"
+        // choice may have left one of their dependencies disabled. Visiting
+        // each installed package once also handles cycles and shared edges.
+        while let Some(index) = queue.pop_front() {
+            let package = &state.installed[index];
+            for reference in &package.dependencies {
+                let (name, _) = dependency(reference)?;
+                let dependency_index = *by_name.get(name.as_str())
+                    .with_context(|| format!("{} requires installed dependency {name}", package.name))?;
+                if affected.insert(dependency_index) {
+                    queue.push_back(dependency_index);
+                }
+            }
+        }
+    }
+    for index in affected {
+        let package = &mut state.installed[index];
+        package.enabled = enabled;
+        state.disabled_dependency_overrides.remove(&package.full_name);
+    }
+    // Validate the entire resulting profile before saving any changes.
     validate_enabled_dependencies(&state)?;
     state.save(profile)?;
     Ok(state)
@@ -900,6 +928,63 @@ mod tests {
         fs::create_dir_all(directory.join("plugins")).unwrap();
         fs::write(directory.join(".r2mml-complete"), b"complete").unwrap();
         fs::write(directory.join("plugins/payload.txt"), name.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn enabling_restores_transitive_dependencies_and_preserves_unrelated_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ProfileState {
+            installed: vec![
+                installed("A", false, &["Test-B-1.0.0", "Test-Shared-1.0.0"]),
+                // Already enabled dependencies must also be traversed: their
+                // own dependencies may have been explicitly disabled.
+                installed("B", true, &["Test-C-1.0.0"]),
+                installed("C", false, &["Test-A-1.0.0", "Test-Shared-1.0.0"]),
+                installed("Shared", false, &[]),
+                installed("OtherDependent", false, &["Test-A-1.0.0"]),
+                installed("Unrelated", false, &[]),
+                installed("UnrelatedConsumer", true, &["Test-Unrelated-1.0.0"]),
+            ],
+            disabled_dependency_overrides: BTreeSet::from([
+                "Test-A".into(), "Test-C".into(), "Test-Unrelated".into(),
+            ]),
+        };
+        state.installed[0].explicit = true;
+        state.installed[5].explicit = true;
+        state.save(dir.path()).unwrap();
+
+        let updated = toggle(dir.path(), "Test-A", true).unwrap();
+        // The cycle and shared dependency terminate without enabling reverse
+        // dependents or changing install metadata / explicit-install flags.
+        for package in &mut state.installed[..4] {
+            package.enabled = true;
+        }
+        state.disabled_dependency_overrides = BTreeSet::from(["Test-Unrelated".into()]);
+        let expected = serde_json::to_value(state).unwrap();
+        assert_eq!(serde_json::to_value(updated).unwrap(), expected);
+        assert_eq!(serde_json::to_value(ProfileState::load(dir.path()).unwrap()).unwrap(), expected);
+    }
+
+    #[test]
+    fn enabling_missing_or_incompatible_dependencies_leaves_profile_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        for include_old_dependency in [false, true] {
+            let mut state = ProfileState {
+                installed: vec![
+                    installed("A", false, &["Test-B-1.0.0"]),
+                    installed("B", false, &["Test-C-2.0.0"]),
+                ],
+                disabled_dependency_overrides: BTreeSet::from(["Test-B".into()]),
+            };
+            if include_old_dependency {
+                state.installed.push(installed("C", false, &[]));
+                state.disabled_dependency_overrides.insert("Test-C".into());
+            }
+            state.save(dir.path()).unwrap();
+            let before = fs::read(dir.path().join("profile.json")).unwrap();
+            assert!(toggle(dir.path(), "Test-A", true).is_err());
+            assert_eq!(fs::read(dir.path().join("profile.json")).unwrap(), before);
+        }
     }
 
     #[test]
