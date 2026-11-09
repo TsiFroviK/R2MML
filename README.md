@@ -1,8 +1,19 @@
-# R2MML
+<p align="center">
+  <img src="assets/r2mml-icon.png" width="120" height="120" alt="R2MML icon">
+</p>
+
+<h1 align="center">R2MML</h1>
+
+<p align="center">
+  <strong>Your Risk2Mac mods, together in one native Mac app.</strong><br>
+  Browse Thunderstore. Install dependencies. Play with mods.
+</p>
+
+<p align="center">
+  <a href="README.ru.md">Русский</a> · <a href="https://github.com/TsiFroviK/R2MML/releases">Download</a>
+</p>
 
 **Risk2MacModLoader** — a macOS mod manager for the [Risk2Mac](https://github.com/TsiFroviK/Risk2Mac) port of Risk of Rain 2, written in Rust.
-
-[Русский](README.ru.md) · [Download](https://github.com/TsiFroviK/R2MML/releases)
 
 Browse Thunderstore, choose a mod version, install its dependencies, and start the game with or without mods. R2MML keeps mods and their configuration outside the game application. Opening the game normally continues to start vanilla.
 

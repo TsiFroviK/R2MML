@@ -258,7 +258,7 @@ impl UiState {
                 if navigation(
                     ui,
                     lang.text("Installed", "Установлено"),
-                    data.installed.len(),
+                    Some(data.installed.len()),
                     self.page == Page::Installed,
                 ) {
                     self.page = Page::Installed;
@@ -268,7 +268,7 @@ impl UiState {
                 if navigation(
                     ui,
                     lang.text("Online", "Каталог"),
-                    data.catalog.len(),
+                    Some(data.catalog.len()),
                     self.page == Page::Online,
                 ) {
                     self.page = Page::Online;
@@ -280,7 +280,7 @@ impl UiState {
                 if navigation(
                     ui,
                     lang.text("Settings", "Настройки"),
-                    0,
+                    None,
                     self.page == Page::Settings,
                 ) {
                     self.page = Page::Settings;
@@ -1099,28 +1099,81 @@ impl UiState {
     }
 }
 
-fn navigation(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> bool {
-    let text = if count > 0 {
-        format!("{name}   {count}")
+fn navigation(ui: &mut egui::Ui, name: &str, count: Option<usize>, selected: bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            selected,
+            count
+                .map(|value| format!("{name}, {value}"))
+                .unwrap_or_else(|| name.to_owned()),
+        )
+    });
+    let background = if selected {
+        BLUE.gamma_multiply(if ui.visuals().dark_mode { 0.30 } else { 0.14 })
+    } else if response.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
     } else {
-        name.to_owned()
+        Color32::TRANSPARENT
     };
-    ui.add_sized(
-        [ui.available_width(), 36.0],
-        egui::Button::new(RichText::new(text).strong()).selected(selected),
-    )
-    .clicked()
+    ui.painter().rect_filled(rect, 8.0, background);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            8.0,
+            Stroke::new(1.0_f32, BLUE),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let mut label_right = rect.right() - 12.0;
+    if let Some(count) = count {
+        let color = if selected {
+            Color32::from_rgb(23, 48, 77)
+        } else {
+            Color32::WHITE
+        };
+        let galley =
+            ui.painter()
+                .layout_no_wrap(count.to_string(), FontId::proportional(11.0), color);
+        let badge_width = (galley.size().x + 14.0).max(22.0);
+        let badge = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 12.0 - badge_width / 2.0, rect.center().y),
+            Vec2::new(badge_width, 22.0),
+        );
+        ui.painter().rect_filled(
+            badge,
+            5.0,
+            if selected {
+                Color32::from_rgb(232, 241, 255)
+            } else {
+                BLUE
+            },
+        );
+        ui.painter()
+            .galley(badge.center() - galley.size() / 2.0, galley, color);
+        label_right = badge.left() - 10.0;
+    }
+    let label_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 12.0, rect.top()),
+        egui::pos2(label_right, rect.bottom()),
+    );
+    ui.painter().with_clip_rect(label_rect).text(
+        egui::pos2(label_rect.left(), label_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        name,
+        FontId::proportional(13.0),
+        ui.visuals().text_color(),
+    );
+    response.clicked()
 }
 
 fn logo(ui: &mut egui::Ui, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 11.0, BLUE);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "R²",
-        FontId::proportional(size * 0.58),
-        Color32::WHITE,
+    ui.add(
+        egui::Image::new(egui::include_image!("../assets/r2mml-icon.png"))
+            .fit_to_exact_size(Vec2::splat(size)),
     );
 }
 

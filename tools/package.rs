@@ -1,6 +1,5 @@
 //! Native packaging tool. No scripting runtime is required to build a release.
 use anyhow::{Context, Result, bail};
-use image::{ImageBuffer, Rgba};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -177,39 +176,8 @@ fn main() -> Result<()> {
 fn icon(output: &Path, resources: &Path) -> Result<()> {
     let set = output.join("R2MML.iconset");
     fs::create_dir_all(&set)?;
-    let source: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(1024, 1024, |x, y| {
-        let (x, y) = (x as f32 / 1024.0, y as f32 / 1024.0);
-        let corner = 0.22;
-        let dx = (x.clamp(corner, 1.0 - corner) - x).abs();
-        let dy = (y.clamp(corner, 1.0 - corner) - y).abs();
-        if dx * dx + dy * dy > corner * corner {
-            return Rgba([0, 0, 0, 0]);
-        }
-        let glow = (1.0 - ((x - 0.25).powi(2) + (y - 0.15).powi(2)).sqrt()).max(0.0);
-        let mut color = [
-            (18.0 + 30.0 * glow) as u8,
-            (73.0 + 83.0 * glow) as u8,
-            (170.0 + 65.0 * glow) as u8,
-            255,
-        ];
-        // Two original interlocking module shapes; no game artwork or third-party marks.
-        let rounded = |cx: f32, cy: f32, w: f32, h: f32, r: f32| {
-            let px = (x - cx).abs() - w * 0.5 + r;
-            let py = (y - cy).abs() - h * 0.5 + r;
-            px.max(0.0).powi(2) + py.max(0.0).powi(2) <= r * r && px <= r && py <= r
-        };
-        let first =
-            rounded(0.40, 0.43, 0.36, 0.40, 0.09) && !rounded(0.40, 0.43, 0.17, 0.21, 0.025);
-        let second =
-            rounded(0.61, 0.60, 0.36, 0.40, 0.09) && !rounded(0.61, 0.60, 0.17, 0.21, 0.025);
-        if first {
-            color = [235, 245, 255, 255];
-        }
-        if second {
-            color = [128, 245, 224, 255];
-        }
-        Rgba(color)
-    });
+    let source = image::load_from_memory(include_bytes!("../assets/r2mml-icon.png"))?
+        .into_rgba8();
     for size in [16u32, 32, 128, 256, 512] {
         for scale in [1u32, 2] {
             let filename = if scale == 1 {
