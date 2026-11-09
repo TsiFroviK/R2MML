@@ -164,6 +164,8 @@ fn main() -> Result<()> {
         &[app.to_str().unwrap(), staged_app.to_str().unwrap()],
     )?;
     #[cfg(unix)]
+    portable_permissions(&staged_app)?;
+    #[cfg(unix)]
     std::os::unix::fs::symlink("/Applications", staging.path().join("Applications"))?;
     run(
         "/usr/bin/hdiutil",
@@ -194,6 +196,31 @@ fn main() -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(unix)]
+fn portable_permissions(app: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fn visit(path: &Path, executable: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            bail!("Unexpected link in application staging: {}", path.display())
+        }
+        let mode = if metadata.is_dir() || path == executable {
+            0o755
+        } else {
+            0o644
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                visit(&entry?.path(), executable)?;
+            }
+        }
+        Ok(())
+    }
+    visit(app, &app.join("Contents/MacOS/R2MML"))
+}
+
 fn icon(output: &Path, resources: &Path) -> Result<()> {
     let set = output.join("R2MML.iconset");
     fs::create_dir_all(&set)?;
