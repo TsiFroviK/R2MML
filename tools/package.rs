@@ -149,35 +149,55 @@ fn main() -> Result<()> {
         "/usr/bin/codesign",
         &["--verify", "--deep", "--strict", app.to_str().unwrap()],
     )?;
-    let archive = root
+    let disk_image = root
         .join("dist")
-        .join(format!("R2MML-{version}-macOS-{suffix}.zip"));
-    if archive.exists() {
-        bail!("Archive already exists: {}", archive.display())
+        .join(format!("R2MML-{version}-macOS-{suffix}.dmg"));
+    if disk_image.exists() {
+        bail!("Disk image already exists: {}", disk_image.display())
     }
+    // Use the Mac's temporary filesystem: an external exFAT volume cannot
+    // store the Applications symlink used for drag-and-drop installation.
+    let staging = tempfile::Builder::new().prefix("r2mml-dmg-").tempdir()?;
+    let staged_app = staging.path().join("R2MML.app");
     run(
         "/usr/bin/ditto",
+        &[app.to_str().unwrap(), staged_app.to_str().unwrap()],
+    )?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/Applications", staging.path().join("Applications"))?;
+    run(
+        "/usr/bin/hdiutil",
         &[
-            "-c",
-            "-k",
-            "--sequesterRsrc",
-            "--keepParent",
-            app.to_str().unwrap(),
-            archive.to_str().unwrap(),
+            "create",
+            "-volname",
+            "R2MML",
+            "-fs",
+            "HFS+",
+            "-format",
+            "UDZO",
+            "-srcfolder",
+            staging
+                .path()
+                .to_str()
+                .context("Non-Unicode staging path")?,
+            disk_image.to_str().unwrap(),
         ],
     )?;
+    run(
+        "/usr/bin/hdiutil",
+        &["verify", disk_image.to_str().unwrap()],
+    )?;
     println!(
-        "Application: {}\nArchive: {}",
+        "Application: {}\nDisk image: {}",
         app.display(),
-        archive.display()
+        disk_image.display()
     );
     Ok(())
 }
 fn icon(output: &Path, resources: &Path) -> Result<()> {
     let set = output.join("R2MML.iconset");
     fs::create_dir_all(&set)?;
-    let source = image::load_from_memory(include_bytes!("../assets/r2mml-icon.png"))?
-        .into_rgba8();
+    let source = image::load_from_memory(include_bytes!("../assets/r2mml-icon.png"))?.into_rgba8();
     for size in [16u32, 32, 128, 256, 512] {
         for scale in [1u32, 2] {
             let filename = if scale == 1 {

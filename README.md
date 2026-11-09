@@ -35,7 +35,7 @@ The application and its packaging tool are implemented in Rust. The interface us
 ## Install
 
 1. Install a working [Risk2Mac game build](https://github.com/TsiFroviK/Risk2Mac). The manager expects its `.app` layout and compatibility components.
-2. Download the macOS release from [Releases](https://github.com/TsiFroviK/R2MML/releases), extract it in Finder, and move **R2MML.app** to **Applications**.
+2. Download the macOS **DMG** from [Releases](https://github.com/TsiFroviK/R2MML/releases), open it in Finder, and drag **R2MML.app** into **Applications**. Eject the disk image after copying.
 3. Open R2MML. In **Settings**, select **Risk of Rain 2.app** if it was not detected automatically.
 4. Open **Online**, select a mod, click **Download**, select a version, and install it with dependencies.
 5. Use **Start modded**. The first modded launch downloads and verifies the native macOS BepInEx runtime.
@@ -111,7 +111,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo run --locked --bin package -- --universal
 ```
 
-The Rust packaging tool builds the binaries, creates the `.app` and icon, signs it locally, and prepares release output in `dist/`. No proprietary game data, Unity runtime, Steam binary, or downloaded mod is needed to compile R2MML.
+The Rust packaging tool builds the binaries, creates the `.app` and icon, signs the application locally, and creates a **DMG** installer in `dist/`. No proprietary game data, Unity runtime, Steam binary, or downloaded mod is needed to compile R2MML.
 
 ## License and attribution
 
