@@ -15,6 +15,10 @@ const RUNTIME_SHA256: &str = "2e711e21f6570da964fce4654b1976500dbe043f61778bce00
 const MAX_RUNTIME_ARCHIVE: u64 = 4 * 1024 * 1024;
 const PLAYER_NAME: &str = "Risk of Rain 2 Player";
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "unity_assets.rs"]
+mod unity_assets;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameInfo {
     pub app_path: PathBuf,
@@ -430,6 +434,7 @@ fn clean_loader_environment(command: &mut Command) {
     for (key, _) in std::env::vars_os() {
         let text = key.to_string_lossy();
         if text.starts_with("DOORSTOP_")
+            || text == "R2MML_UNITY_ASSEMBLY_MAP"
             || text.starts_with("MONOMOD_")
             || text.starts_with("BEPINEX_")
             || matches!(
@@ -442,6 +447,19 @@ fn clean_loader_environment(command: &mut Command) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn require_idle_game() -> Result<()> {
+    let processes = Command::new("/bin/ps").args(["-axo", "pid=,comm="]).output()?;
+    ensure!(processes.status.success(), "Could not check running game processes");
+    ensure!(
+        !String::from_utf8_lossy(&processes.stdout)
+            .lines()
+            .any(|line| line.trim_end().ends_with(&format!("/{PLAYER_NAME}"))),
+        "Close Risk of Rain 2 before starting another session"
+    );
+    Ok(())
+}
+
 pub fn launch_game(game: &Path, profile: &Path, runtime: &Path, modded: bool) -> Result<u32> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -452,15 +470,7 @@ pub fn launch_game(game: &Path, profile: &Path, runtime: &Path, modded: bool) ->
     {
         use std::os::unix::process::CommandExt;
         let info = validate_game(game)?;
-        let processes = Command::new("/bin/ps")
-            .args(["-axo", "pid=,comm="])
-            .output()?;
-        ensure!(
-            !String::from_utf8_lossy(&processes.stdout)
-                .lines()
-                .any(|line| line.trim_end().ends_with(&format!("/{PLAYER_NAME}"))),
-            "Close Risk of Rain 2 before starting another session"
-        );
+        require_idle_game()?;
         let contents = info.app_path.join("Contents");
         if !modded {
             let plist = plist::Value::from_file(contents.join("Info.plist"))?;
@@ -483,6 +493,17 @@ pub fn launch_game(game: &Path, profile: &Path, runtime: &Path, modded: bool) ->
                 .id());
         }
         let profile = assert_external_profile(profile, &info.app_path)?;
+        let lock_path = profile.join(".launch-lock");
+        ensure!(!lock_path.is_symlink(), "Profile launch lock must be a regular file");
+        let launch_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        FileExt::try_lock_exclusive(&launch_lock)
+            .context("Another launch is using this mod profile")?;
+        require_idle_game()?;
         ensure!(
             !runtime.canonicalize()?.starts_with(&info.app_path),
             "The mod runtime must be outside the game application"
@@ -511,10 +532,33 @@ pub fn launch_game(game: &Path, profile: &Path, runtime: &Path, modded: bool) ->
             info.architecture,
             RUNTIME_VERSION
         )?;
+        let stage = (|| -> Result<_> {
+            if unity_assets::adapt_starstorm_hooks(&info.app_path, &active)? {
+                writeln!(launcher_log, "Starstorm 2 hooks adapted to this Risk2Mac build")?;
+            }
+            let state = crate::install::ProfileState::load(&profile)?;
+            let assemblies = crate::install::unity_asset_assemblies(&active.join("plugins"), &state, &mut launcher_log)?;
+            if assemblies.is_empty() {
+                return Ok(None);
+            }
+            let staged = unity_assets::prepare(&info.app_path, &profile, &assemblies)?;
+            writeln!(launcher_log, "Registered {} mod assemblies with Unity", staged.assembly_count)?;
+            Ok(Some(staged))
+        })()
+        .map_err(|error| startup_error(error, &launcher_path, &unity_log))?;
         let mut libraries = vec![runtime.join("libdoorstop.dylib")];
-        let mut command = Command::new(&info.executable);
+        let executable = stage
+            .as_ref()
+            .map_or(info.executable.as_path(), |staged| staged.executable.as_path());
+        let mut command = Command::new(executable);
         clean_loader_environment(&mut command);
         command.env("UNITY_DISPLAYLINK_BLIT", "0");
+        if let Some(staged) = &stage {
+            staged
+                .install_loader(&profile.join("BepInEx/core"))
+                .map_err(|error| startup_error(error, &launcher_path, &unity_log))?;
+            command.env("R2MML_UNITY_ASSEMBLY_MAP", &staged.assembly_map);
+        }
         if info.steam {
             configure_steam_overlay(&info, &mut command, &mut libraries, &mut launcher_log)?;
         }
@@ -543,15 +587,24 @@ pub fn launch_game(game: &Path, profile: &Path, runtime: &Path, modded: bool) ->
             .stdout(Stdio::from(launcher_log.try_clone()?))
             .stderr(Stdio::from(launcher_log))
             .process_group(0);
+        require_idle_game().map_err(|error| startup_error(error, &launcher_path, &unity_log))?;
         let mut child = command
             .spawn()
             .context("Could not start the modded game")
             .map_err(|error| startup_error(error, &launcher_path, &unity_log))?;
-        if let Err(mut error) = wait_for_modded_startup(&mut child, &unity_log, expects_plugins) {
+        if let Err(mut error) =
+            wait_for_modded_startup(&mut child, &unity_log, expects_plugins, stage.is_some())
+        {
             if let Err(stop_error) = child.kill()
                 && !child.try_wait().is_ok_and(|status| status.is_some())
             {
                 error = error.context(format!("Could not stop the failed game: {stop_error}"));
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    drop(stage);
+                    drop(launch_lock);
+                });
+                return Err(startup_error(error, &launcher_path, &unity_log));
             } else {
                 let _ = child.wait();
             }
@@ -560,6 +613,8 @@ pub fn launch_game(game: &Path, profile: &Path, runtime: &Path, modded: bool) ->
         let pid = child.id();
         std::thread::spawn(move || {
             let _ = child.wait();
+            drop(stage);
+            drop(launch_lock);
         });
         Ok(pid)
     }
@@ -590,6 +645,7 @@ fn contains_plugin_dll(directory: &Path) -> Result<bool> {
 struct StartupLog {
     pending: Vec<u8>,
     loader_failure: Option<String>,
+    asset_failure: Option<String>,
     complete: bool,
     reached_menu: bool,
 }
@@ -612,10 +668,15 @@ impl StartupLog {
     }
 
     fn observe_line(&mut self, line: &str, expects_plugins: bool) {
+        self.reached_menu |= line == "BaseMainMenuScreen: OnEnter()";
+        if !self.reached_menu
+            && line.starts_with("Rethrow as TargetInvocationException: Error in invoking SystemInitializer for ")
+        {
+            self.asset_failure.get_or_insert_with(|| line.to_owned());
+        }
         if self.complete {
             return;
         }
-        self.reached_menu |= line == "BaseMainMenuScreen: OnEnter()";
         let Some((header, message)) = line.strip_prefix('[').and_then(|line| line.split_once(']'))
         else {
             return;
@@ -660,8 +721,10 @@ fn wait_for_modded_startup(
     child: &mut std::process::Child,
     unity_log: &Path,
     expects_plugins: bool,
+    expects_mod_assets: bool,
 ) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(if expects_mod_assets { 300 } else { 120 });
     let mut log = None;
     let mut startup = StartupLog::default();
     let mut buffer = [0; 64 * 1024];
@@ -687,10 +750,13 @@ fn wait_for_modded_startup(
         if let Some(failure) = &startup.loader_failure {
             bail!("BepInEx could not load the mod profile:\n{failure}");
         }
+        if expects_mod_assets && let Some(failure) = &startup.asset_failure {
+            bail!("Unity could not initialize the mod profile:\n{failure}");
+        }
         if let Some(status) = status {
             bail!("The game exited during modded startup ({status})");
         }
-        if startup.complete {
+        if startup.complete && (!expects_mod_assets || startup.reached_menu) {
             return Ok(());
         }
         ensure!(
@@ -699,7 +765,12 @@ fn wait_for_modded_startup(
         );
         ensure!(
             std::time::Instant::now() < deadline,
-            "Timed out waiting for BepInEx to finish startup"
+            "{}",
+            if startup.complete {
+                "Timed out waiting for Unity to finish loading mod assets"
+            } else {
+                "Timed out waiting for BepInEx to finish startup"
+            }
         );
         if count < buffer.len() {
             std::thread::sleep(Duration::from_millis(150));
@@ -873,6 +944,17 @@ mod tests {
         assert!(!startup.complete);
         startup.read(b"complete\n", true);
         assert!(startup.complete);
+        assert!(startup.loader_failure.is_none());
+    }
+
+    #[test]
+    fn distinguishes_unity_asset_initialization_from_chainloader_completion() {
+        let mut startup = StartupLog::default();
+        startup.read(b"[Message:   BepInEx] Chainloader startup complete\n", true);
+        assert!(!startup.reached_menu);
+        assert!(startup.asset_failure.is_none());
+        startup.read(b"Rethrow as TargetInvocationException: Error in invoking SystemInitializer for Example.Mod.Init\n", true);
+        assert!(startup.asset_failure.is_some());
         assert!(startup.loader_failure.is_none());
     }
 

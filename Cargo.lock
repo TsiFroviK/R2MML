@@ -2848,7 +2848,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "r2mml"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2866,6 +2866,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "unity-bundle-assets",
  "wgpu",
  "zip",
 ]
@@ -3869,6 +3870,15 @@ name = "unicode-width"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
+
+[[package]]
+name = "unity-bundle-assets"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3508ae39f82e7d83a9999f2829a42ce5b26aa039723363ff57380b26c4980d6f"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "untrusted"

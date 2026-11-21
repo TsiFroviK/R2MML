@@ -135,6 +135,10 @@ fn main() -> Result<()> {
     for file in ["LICENSE", "README.md", "README.ru.md", "THIRD_PARTY.md"] {
         fs::copy(root.join(file), resources.join(file))?;
     }
+    fs::copy(
+        root.join("compatibility/unity/BepInEx-LICENSE.txt"),
+        resources.join("BepInEx-LICENSE.txt"),
+    )?;
     notices(&resources, &arches)?;
     run(
         "/usr/bin/codesign",

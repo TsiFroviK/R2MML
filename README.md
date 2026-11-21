@@ -61,7 +61,11 @@ R2MML uses the official [BepInEx 5.4.23.6 macOS universal release](https://githu
 
 Thunderstore's **bbepis-BepInExPack** is treated as a runtime requirement provided by this macOS runtime. Its Windows loader files and Windows distribution's additional default packages are not installed. Normal mods' own explicit dependencies are still resolved and installed, including game-specific packages if they name them directly.
 
-R2MML supplies a verified macOS adaptation of **RoR2BepInExPack** for R2API Core and the modules that depend on it. Installing or updating R2API prepares the compatibility layer automatically. Installed packages using it show an **R2MML Patch** badge. New R2API versions can use the same layer when their requirements remain compatible. A new, unsupported version of the underlying pack requires its own verified adaptation.
+R2MML supplies a verified macOS adaptation of **RoR2BepInExPack** for R2API Core and the modules that depend on it. Installing or updating R2API prepares the compatibility layer automatically. New R2API versions can use the same layer when their requirements remain compatible. A new, unsupported version of the underlying pack requires its own verified adaptation.
+
+When a mod's asset bundles reference custom scripts, R2MML registers their assemblies with Unity in a temporary game copy for the modded session. The ordinary game launches from your original application. [Unity compatibility](compatibility/unity/README.md)
+
+Starstorm 2 0.6.47 uses Moonstorm Shared Utils 2.6.3 or later. R2MML automatically adapts its CombatDirector hooks for the verified Risk2Mac 1.5.0 build without changing the installed Thunderstore package.
 
 The manager checks GitHub Releases at startup and periodically. Choose **Update** to download the universal DMG and restart with the new version at the same application path. Choose **Later** to defer the prompt, or **Don't remind me** to turn checks off. Re-enable them in **Settings**.
 

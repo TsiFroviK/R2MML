@@ -11,6 +11,10 @@ pub(super) const PACK: &str = "RiskofThunder-RoR2BepInExPack";
 pub(super) const PACK_DEPENDENCY: &str = "RiskofThunder-RoR2BepInExPack-1.50.0";
 pub(super) const ADAPTER: &str = "ror2bepinexpack-darwin-1";
 pub(super) const DLL: &str = "plugins/RoR2BepInExPack/RoR2BepInExPack.dll";
+pub(super) const STARSTORM: &str = "TeamMoonstorm-Starstorm2";
+pub(super) const STARSTORM_RELEASE: &str = "0.6.47";
+pub(super) const STARSTORM_MSU: &str = "TeamMoonstorm-MoonstormSharedUtils";
+pub(super) const STARSTORM_MSU_DEPENDENCY: &str = "TeamMoonstorm-MoonstormSharedUtils-2.6.3";
 
 struct Recipe {
     version: &'static str,
@@ -77,6 +81,14 @@ pub(super) fn add_dependencies(name: &str, version: &str, dependencies: &mut Vec
         && !dependencies.iter().any(|d| d == PACK_DEPENDENCY)
     {
         dependencies.push(PACK_DEPENDENCY.into());
+    }
+    // The package declares MSU 2.5.1, but its loader uses the pooled
+    // ParallelCoroutine API that is present in 2.6.3.
+    if name == STARSTORM
+        && version == STARSTORM_RELEASE
+        && !dependencies.iter().any(|dependency| dependency == STARSTORM_MSU_DEPENDENCY)
+    {
+        dependencies.push(STARSTORM_MSU_DEPENDENCY.into());
     }
 }
 

@@ -12,6 +12,12 @@ use std::{
 
 #[path = "compat.rs"]
 mod compat;
+#[cfg(any(target_os = "macos", test))]
+#[path = "unity_discover.rs"]
+mod unity_discover;
+
+#[cfg(target_os = "macos")]
+pub(crate) use unity_discover::discover as unity_asset_assemblies;
 
 const PROVIDED_RUNTIME: &str = "bbepis-BepInExPack";
 const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
@@ -36,52 +42,10 @@ pub struct InstalledMod {
     pub macos_adapter: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MacCompatibility {
-    Adapted,
-    CompatibilityLayer,
-}
-
 fn is_adapted(package: &InstalledMod) -> bool {
     package.full_name == compat::PACK
         && package.macos_adapter.as_deref() == Some(compat::ADAPTER)
         && compat::can_adapt(&package.full_name, &package.version)
-}
-
-pub(crate) fn macos_compatibility(
-    package: &InstalledMod,
-    installed: &[InstalledMod],
-) -> Option<MacCompatibility> {
-    if is_adapted(package) {
-        return Some(MacCompatibility::Adapted);
-    }
-    if !(package.full_name.starts_with("RiskofThunder-R2API_")
-        || package.full_name == "tristanmcpherson-R2API")
-    {
-        return None;
-    }
-    let mut pending = vec![package];
-    let mut visited = BTreeSet::new();
-    while let Some(item) = pending.pop() {
-        if !visited.insert(&item.full_name) {
-            continue;
-        }
-        for reference in &item.dependencies {
-            let Ok((name, minimum)) = dependency(reference) else {
-                continue;
-            };
-            let Some(target) = installed.iter().find(
-                |p| p.full_name == name && Version::parse(&p.version).is_ok_and(|v| v >= minimum),
-            ) else {
-                continue;
-            };
-            if is_adapted(target) {
-                return Some(MacCompatibility::CompatibilityLayer);
-            }
-            pending.push(target);
-        }
-    }
-    None
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -520,6 +484,30 @@ pub fn prepare_compatibility(
                 .join(format!("{}-{}", package.full_name, package.version));
             compat::prepare_pack(profile, &source, &package.version)?;
             package.macos_adapter = Some(compat::ADAPTER.into());
+            changed = true;
+        }
+    }
+    if let Some(index) = state.installed.iter().position(|package| {
+        package.enabled && package.full_name == compat::STARSTORM && package.version == compat::STARSTORM_RELEASE
+    }) {
+        let mut dependencies = state.installed[index].dependencies.clone();
+        compat::add_dependencies(compat::STARSTORM, compat::STARSTORM_RELEASE, &mut dependencies);
+        if dependencies != state.installed[index].dependencies {
+            let (_, minimum) = dependency(compat::STARSTORM_MSU_DEPENDENCY)?;
+            let available = state.installed.iter().any(|package| {
+                package.full_name == compat::STARSTORM_MSU
+                    && (package.enabled || state.disabled_dependency_overrides.contains(compat::STARSTORM_MSU))
+                    && Version::parse(&package.version).is_ok_and(|version| version >= minimum)
+            });
+            if !available {
+                let catalog = crate::catalog::fetch_catalog(cache)?;
+                let package = catalog.iter().find(|package| package.full_name == compat::STARSTORM)
+                    .context("Starstorm 2 is missing from the Thunderstore catalog")?;
+                return install_packages(
+                    package, compat::STARSTORM_RELEASE, &catalog, profile, cache, progress, state.installed[index].explicit,
+                ).map(Some);
+            }
+            state.installed[index].dependencies = dependencies;
             changed = true;
         }
     }
@@ -1034,25 +1022,6 @@ mod tests {
             BTreeMap::from([(compat::CORE, "5.4.0"), (compat::PACK, "1.50.0")]),
         );
         assert!(plan_install(&pack, "1.51.0", &catalog, dir.path()).is_err());
-    }
-
-    #[test]
-    fn badge_requires_an_adapted_provider_in_the_dependency_graph() {
-        let mut core = installed("Core", true, &[compat::PACK_DEPENDENCY]);
-        core.full_name = compat::CORE.into();
-        core.version = "5.3.0".into();
-        let mut addressables = installed("Addressables", true, &["RiskofThunder-R2API_Core-5.3.0"]);
-        addressables.full_name = "RiskofThunder-R2API_Addressables".into();
-        let mut pack = installed("Pack", true, &[]);
-        pack.full_name = compat::PACK.into();
-        pack.version = "1.50.0".into();
-        assert_eq!(macos_compatibility(&addressables, &[core.clone(), pack.clone()]), None);
-        pack.macos_adapter = Some(compat::ADAPTER.into());
-        assert_eq!(
-            macos_compatibility(&addressables, &[core, pack.clone()]),
-            Some(MacCompatibility::CompatibilityLayer)
-        );
-        assert_eq!(macos_compatibility(&pack, &[]), Some(MacCompatibility::Adapted));
     }
 
     #[test]

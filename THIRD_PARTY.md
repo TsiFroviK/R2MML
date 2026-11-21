@@ -2,7 +2,7 @@
 
 R2MML's application and packaging tool are written in Rust. The repository
 contains no Risk of Rain 2 assets, assemblies, Unity player, Steam library,
-mod archive, or BepInEx binary. The icon is original project artwork.
+or mod archives. The icon is original project artwork.
 
 Rust dependencies retain their respective licenses. `Cargo.lock` pins the
 dependency graph. Release bundles include `Contents/Resources/DEPENDENCY-LICENSES.txt`
@@ -15,9 +15,10 @@ At the first modded launch, R2MML downloads the official
 verifies its pinned SHA-256, and stores it outside the game. BepInEx is
 [MIT licensed](https://github.com/BepInEx/BepInEx/blob/v5.4.23.6/LICENSE);
 [Unity Doorstop](https://github.com/NeighTools/UnityDoorstop) is LGPL-2.1 licensed.
-Their files are downloaded unmodified, with included license notices retained.
-Neither is bundled into R2MML releases. Their corresponding source is available
-from the linked upstream projects and release tags.
+R2MML downloads the stock runtime and Doorstop unmodified and retains their
+license notices. Releases include a derived MIT-licensed BepInEx Chainloader for
+modded sessions that require Unity script registration. Its source inputs, build
+instructions and license are in [compatibility/unity](compatibility/unity/README.md).
 
 Thunderstore packages are downloaded from Thunderstore only when selected
 by the user or required as dependencies. Each mod keeps its own license,

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 
 use crate::catalog::Package;
-use crate::install::{InstalledMod, MacCompatibility};
+use crate::install::InstalledMod;
 use crate::launch::RUNTIME_VERSION;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -630,7 +630,6 @@ impl UiState {
                                 None
                             },
                             None,
-                            None,
                             data.busy,
                             lang,
                         )
@@ -716,7 +715,6 @@ impl UiState {
                             } else {
                                 Some(lang.text("Dependency", "Зависимость"))
                             },
-                            crate::install::macos_compatibility(item, data.installed),
                             Some(item.enabled),
                             data.busy,
                             lang,
@@ -1746,7 +1744,6 @@ fn package_row(
     description: &str,
     selected: bool,
     badge: Option<&str>,
-    patch: Option<MacCompatibility>,
     enabled: Option<bool>,
     busy: bool,
     lang: Language,
@@ -1796,40 +1793,10 @@ fn package_row(
                                 // switch stays at the same trailing edge of its card.
                                 ui.set_width(text_width);
                                 ui.spacing_mut().item_spacing.y = 3.0;
-                                let title = egui::Label::new(
-                                    RichText::new(name.replace('_', " ")).strong(),
-                                ).truncate();
-                                if let Some(patch) = patch {
-                                    let patch_label = lang.text("R2MML Patch", "R2MML Патч");
-                                    let badge_text = ui.painter().layout_no_wrap(
-                                        patch_label.to_owned(), FontId::proportional(10.0), Color32::WHITE,
-                                    );
-                                    let badge_width = badge_text.size().x + 12.0;
-                                    ui.horizontal(|ui| {
-                                        let title_width = (text_width - badge_width - ui.spacing().item_spacing.x).max(0.0);
-                                        ui.scope(|ui| {
-                                            ui.set_max_width(title_width);
-                                            ui.add(title);
-                                        });
-                                        let (rect, response) = ui.allocate_exact_size(
-                                            Vec2::new(badge_width, 16.0), egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(rect, 4.0, BLUE);
-                                        ui.painter().galley(rect.center() - badge_text.size() / 2.0, badge_text, Color32::WHITE);
-                                        response.on_hover_text(match patch {
-                                            MacCompatibility::Adapted => lang.text(
-                                                "R2MML patched this package for macOS.",
-                                                "R2MML адаптировал этот пакет для macOS.",
-                                            ),
-                                            MacCompatibility::CompatibilityLayer => lang.text(
-                                                "This module uses the R2MML macOS patch.",
-                                                "Этот модуль использует патч R2MML для macOS.",
-                                            ),
-                                        });
-                                    });
-                                } else {
-                                    ui.add(title);
-                                }
+                                ui.add(
+                                    egui::Label::new(RichText::new(name.replace('_', " ")).strong())
+                                        .truncate(),
+                                );
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(format!(
@@ -2113,7 +2080,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     action = package_row(
                         ui, "example", "Example", "Author", "1.0.0", "", "Description",
-                        false, None, None, Some(enabled), busy, Language::En,
+                        false, None, Some(enabled), busy, Language::En,
                     );
                 });
             },
