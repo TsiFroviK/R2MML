@@ -1080,7 +1080,7 @@ impl UiState {
             ui.heading(lang.text("R2MML update available", "Доступно обновление R2MML"));
             ui.add_space(6.0);
             if let Some(version) = version {
-                ui.label(format!("R2MML {} → {version}", env!("CARGO_PKG_VERSION")));
+                ui.label(format!("R2MML {} -> {version}", env!("CARGO_PKG_VERSION")));
             }
             ui.label(lang.text(
                 "R2MML will install the update and restart.",
@@ -1941,6 +1941,58 @@ mod tests {
             }
             _ => None,
         }).unwrap_or_else(|| panic!("button label missing: {label}"))
+    }
+
+    #[test]
+    fn update_versions_have_visible_glyphs_in_both_languages() {
+        let prefix = concat!("R2MML ", env!("CARGO_PKG_VERSION"), " ");
+        for language in [Language::En, Language::Ru] {
+            let ctx = egui::Context::default();
+            let mut state = UiState::default();
+            let mut frame = || {
+                ctx.run(egui::RawInput::default(), |ctx| {
+                    state.configure(ctx);
+                    state.update_dialog(
+                        ctx,
+                        &UiData {
+                            language,
+                            catalog: &[],
+                            installed: &[],
+                            game_path: "",
+                            status: "",
+                            busy: false,
+                            progress: None,
+                            error: None,
+                            readme: None,
+                            changelog: None,
+                            check_updates: true,
+                            available_update: Some("1.2.3"),
+                            update_download: None,
+                        },
+                        &mut Vec::new(),
+                    );
+                })
+            };
+            frame();
+            let output = frame();
+            let versions = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text().starts_with(prefix) => {
+                        Some(&text.galley)
+                    }
+                    _ => None,
+                })
+                .expect("the update dialog shows the current and available versions");
+            assert!(versions.text().ends_with("1.2.3"));
+            let font = &versions.job.sections[0].format.font_id;
+            assert!(
+                ctx.fonts_mut(|fonts| fonts.has_glyphs(font, versions.text())),
+                "Missing glyph in {:?}",
+                versions.text()
+            );
+        }
     }
 
     #[test]
