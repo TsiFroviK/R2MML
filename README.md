@@ -39,7 +39,7 @@ The application and its packaging tool are implemented in Rust. The interface us
 
 1. Install a working [Risk2Mac game build](https://github.com/TsiFroviK/Risk2Mac). The manager expects its `.app` layout and compatibility components.
 2. Download the macOS **DMG** from [Releases](https://github.com/TsiFroviK/R2MML/releases), open it in Finder, and drag **R2MML.app** into **Applications**. Eject the disk image after copying.
-3. Open R2MML. If a working game is not found in **Applications** or at your saved location, a small setup window asks you to choose **Risk of Rain 2.app**. The path is remembered; you can change it later in **Settings**.
+3. Open R2MML. It looks for **Risk of Rain 2.app** at your saved location, in **Applications**, and then in your Steam libraries. If it cannot find the Risk2Mac port, the setup window asks you to choose the application. You can change the selected path later in **Settings**.
 4. Open **Online**, select a mod, click **Download**, select a version, and install it with dependencies.
 5. Use **Start modded**. The first modded launch downloads and verifies the native macOS BepInEx runtime.
 

@@ -21,18 +21,22 @@ use std::{
 #[derive(Clone)]
 struct Paths {
     root: PathBuf,
+    steam: PathBuf,
     cache: PathBuf,
     profile: PathBuf,
     logs: PathBuf,
 }
 impl Paths {
     fn new() -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .context("Home directory is unavailable")?;
+        let home = PathBuf::from(
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .context("Home directory is unavailable")?,
+        );
+        let app_support = home.join("Library/Application Support");
         let root = std::env::var_os("R2MML_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(home).join("Library/Application Support/R2MML"));
+            .unwrap_or_else(|| app_support.join("R2MML"));
         if root.components().any(|part| {
             Path::new(part.as_os_str())
                 .extension()
@@ -41,6 +45,7 @@ impl Paths {
             bail!("R2MML data must be stored outside application bundles");
         }
         let paths = Self {
+            steam: app_support.join("Steam"),
             cache: root.join("Cache"),
             profile: root.join("Profiles/Default"),
             logs: root.join("Logs"),
@@ -102,7 +107,7 @@ const DEFAULT_GAME: &str = "/Applications/Risk of Rain 2.app";
 const MAIN_SIZE: [f32; 2] = [1180.0, 760.0];
 const MAIN_MIN_SIZE: [f32; 2] = [940.0, 620.0];
 
-fn resolve_game_path(saved: &str, default: &Path) -> Option<PathBuf> {
+fn resolve_game_path(saved: &str, default: &Path, steam: &Path) -> Option<PathBuf> {
     let saved = saved.trim();
     if !saved.is_empty() {
         if let Ok(game) = launch::validate_game(Path::new(saved)) {
@@ -112,6 +117,7 @@ fn resolve_game_path(saved: &str, default: &Path) -> Option<PathBuf> {
     launch::validate_game(default)
         .ok()
         .map(|game| game.app_path)
+        .or_else(|| crate::steam::find_game(steam))
 }
 
 fn startup_settings(paths: &Paths) -> (Settings, bool) {
@@ -119,7 +125,11 @@ fn startup_settings(paths: &Paths) -> (Settings, bool) {
         .ok()
         .and_then(|data| serde_json::from_slice(&data).ok())
         .unwrap_or_default();
-    let game_path = resolve_game_path(&settings.game_path, Path::new(DEFAULT_GAME));
+    let game_path = resolve_game_path(
+        &settings.game_path,
+        Path::new(DEFAULT_GAME),
+        &paths.steam,
+    );
     let setup_required = game_path.is_none();
     settings.game_path = game_path
         .map(|path| path.to_string_lossy().into_owned())
@@ -982,13 +992,22 @@ mod tests {
         game
     }
 
+    fn steam_game_fixture(library: &Path, directory: &str) -> PathBuf {
+        game_fixture(
+            &library.join("steamapps/common").join(directory),
+            "Risk of Rain 2",
+        )
+    }
+
     #[test]
     fn saved_external_game_takes_precedence_over_applications() {
         let temp = tempfile::tempdir().unwrap();
         let saved = game_fixture(temp.path(), "External game");
         let applications = game_fixture(temp.path(), "Applications game");
+        let steam = temp.path().join("Steam");
+        steam_game_fixture(&steam, "Risk of Rain 2");
         assert_eq!(
-            resolve_game_path(&saved.to_string_lossy(), &applications),
+            resolve_game_path(&saved.to_string_lossy(), &applications, &steam),
             Some(saved.canonicalize().unwrap())
         );
     }
@@ -998,11 +1017,50 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let applications = game_fixture(temp.path(), "Risk of Rain 2");
         let invalid = temp.path().join("Unrelated.app");
+        let steam = temp.path().join("Steam");
+        steam_game_fixture(&steam, "Risk of Rain 2");
         fs::create_dir(&invalid).unwrap();
         for saved in [String::new(), invalid.to_string_lossy().into_owned()] {
             assert_eq!(
-                resolve_game_path(&saved, &applications),
+                resolve_game_path(&saved, &applications, &steam),
                 Some(applications.canonicalize().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn first_launch_finds_a_steam_shortcut_install_without_a_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let steam = temp.path().join("Steam");
+        let game = steam_game_fixture(&steam, "Risk of Rain 2");
+        assert_eq!(
+            resolve_game_path("", &temp.path().join("Missing.app"), &steam),
+            Some(game.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn finds_a_port_in_a_registered_steam_library_with_a_custom_game_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let steam = temp.path().join("Steam");
+        fs::create_dir_all(steam.join("steamapps")).unwrap();
+        let external = temp.path().join("External Steam Library");
+        let game = steam_game_fixture(&external, "Custom Game Folder");
+        fs::write(
+            external.join("steamapps/appmanifest_632360.acf"),
+            r#""AppState" { "appid" "632360" "installdir" "Custom Game Folder" }"#,
+        )
+        .unwrap();
+        let path = serde_json::to_string(&external.to_string_lossy()).unwrap();
+        for library in [format!("{{ \"path\" {path} \"apps\" {{}} }}"), path] {
+            fs::write(
+                steam.join("steamapps/libraryfolders.vdf"),
+                format!("\u{feff}\"libraryfolders\" {{ \"1\" {library} }}"),
+            )
+            .unwrap();
+            assert_eq!(
+                resolve_game_path("", &temp.path().join("Missing.app"), &steam),
+                Some(game.canonicalize().unwrap())
             );
         }
     }
@@ -1011,10 +1069,19 @@ mod tests {
     fn unrelated_app_and_missing_paths_require_game_selection() {
         let temp = tempfile::tempdir().unwrap();
         let invalid = temp.path().join("Unrelated.app");
+        let steam = temp.path().join("Steam");
         fs::create_dir(&invalid).unwrap();
-        assert_eq!(resolve_game_path("", &invalid), None);
+        fs::create_dir_all(steam.join("steamapps/common/Risk of Rain 2/Risk of Rain 2.app")).unwrap();
+        game_fixture(&steam.join("steamapps/Outside"), "Risk of Rain 2");
+        fs::write(
+            steam.join("steamapps/appmanifest_632360.acf"),
+            r#""AppState" { "appid" "632360" "installdir" "../Outside" }"#,
+        )
+        .unwrap();
+        fs::write(steam.join("steamapps/libraryfolders.vdf"), "{ broken").unwrap();
+        assert_eq!(resolve_game_path("", &invalid, &steam), None);
         assert_eq!(
-            resolve_game_path(&invalid.to_string_lossy(), &temp.path().join("Missing.app")),
+            resolve_game_path(&invalid.to_string_lossy(), &temp.path().join("Missing.app"), &steam),
             None
         );
     }

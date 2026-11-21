@@ -5,6 +5,7 @@ mod icon_cache;
 mod install;
 mod launch;
 mod markdown;
+mod steam;
 mod ui;
 mod update;
 
