@@ -3,6 +3,7 @@ use crate::{
     install::{self, ProfileState},
     launch,
     ui::{Language, UiAction, UiData, UiState},
+    update,
 };
 use anyhow::{Context, Result, bail};
 use eframe::egui;
@@ -14,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, mpsc},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone)]
@@ -76,10 +77,25 @@ impl Paths {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
     game_path: String,
+    #[serde(default = "default_update_checks")]
+    check_updates: bool,
+}
+
+fn default_update_checks() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            game_path: String::new(),
+            check_updates: default_update_checks(),
+        }
+    }
 }
 
 const DEFAULT_GAME: &str = "/Applications/Risk of Rain 2.app";
@@ -168,6 +184,7 @@ fn text(lang: Language, ru: &str, en: &str) -> String {
 enum Event {
     Catalog(Result<Vec<Package>, String>),
     Profile(Result<ProfileState, String>),
+    CompatibilityPrepared(ProfileState),
     Launch {
         modded: bool,
         result: Result<u32, String>,
@@ -175,6 +192,9 @@ enum Event {
     Readme(String, Result<String, String>),
     Changelog(String, Result<String, String>),
     Progress(String),
+    UpdateCheck(Result<Option<update::Release>, String>),
+    UpdateProgress(f32),
+    UpdatePrepared(Result<update::PreparedUpdate, String>),
 }
 
 pub struct ManagerApp {
@@ -192,6 +212,10 @@ pub struct ManagerApp {
     readme: Option<String>,
     changelog: Option<String>,
     selected_readme: String,
+    next_update_check: Instant,
+    checking_updates: bool,
+    available_update: Option<update::Release>,
+    update_download: Option<f32>,
     sender: mpsc::Sender<Event>,
     receiver: mpsc::Receiver<Event>,
     #[cfg(debug_assertions)]
@@ -226,6 +250,10 @@ impl ManagerApp {
             readme: None,
             changelog: None,
             selected_readme: String::new(),
+            next_update_check: Instant::now(),
+            checking_updates: false,
+            available_update: None,
+            update_download: None,
             sender,
             receiver,
             #[cfg(debug_assertions)]
@@ -241,6 +269,11 @@ impl ManagerApp {
         }
         if !app.setup_required {
             app.refresh(&cc.egui_ctx, false);
+        }
+        let update_error = app.paths.logs.join("UpdateError.txt");
+        if let Ok(message) = fs::read_to_string(&update_error) {
+            let _ = fs::remove_file(update_error);
+            app.update_failed(message);
         }
         Ok(app)
     }
@@ -351,6 +384,17 @@ impl ManagerApp {
     fn action(&mut self, action: UiAction, ctx: &egui::Context) -> Result<()> {
         match action {
             UiAction::Refresh => self.refresh(ctx, true),
+            UiAction::UpdateNow => self.start_update(ctx),
+            UiAction::UpdateLater => {
+                self.available_update = None;
+                self.next_update_check = Instant::now() + update::CHECK_INTERVAL;
+                ctx.request_repaint();
+            }
+            UiAction::IgnoreUpdates => self.set_update_checks(false)?,
+            UiAction::SetUpdateChecks(enabled) => {
+                self.set_update_checks(enabled)?;
+                ctx.request_repaint();
+            }
             UiAction::ChooseGame => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title(&text(
@@ -508,10 +552,19 @@ impl ManagerApp {
                     let result = (|| -> Result<u32> {
                         launch::validate_game(&game)?;
                         let runtime = if modded {
-                            launch::ensure_runtime(&paths.cache, &|message| {
+                            let progress = |message: &str| {
                                 let _ = sender.send(Event::Progress(message.into()));
                                 ctx.request_repaint();
-                            })?
+                            };
+                            if let Some(profile) = install::prepare_compatibility(
+                                &paths.profile,
+                                &paths.cache,
+                                progress,
+                            )? {
+                                let _ = sender.send(Event::CompatibilityPrepared(profile));
+                                ctx.request_repaint();
+                            }
+                            launch::ensure_runtime(&paths.cache, &progress)?
                         } else {
                             paths.cache.clone()
                         };
@@ -525,16 +578,74 @@ impl ManagerApp {
         }
         Ok(())
     }
-    fn save_game(&mut self, path: String, ctx: &egui::Context) -> Result<()> {
-        let info = launch::validate_game(Path::new(path.trim()))?;
-        let settings = Settings {
-            game_path: info.app_path.to_string_lossy().into_owned(),
+    fn set_update_checks(&mut self, enabled: bool) -> Result<()> {
+        let mut settings = self.settings.clone();
+        settings.check_updates = enabled;
+        self.save_settings(settings)?;
+        self.available_update = None;
+        self.next_update_check = Instant::now();
+        Ok(())
+    }
+    fn check_updates_if_due(&mut self, ctx: &egui::Context) {
+        if !self.settings.check_updates
+            || self.checking_updates
+            || self.available_update.is_some()
+            || self.update_download.is_some()
+        {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.next_update_check {
+            ctx.request_repaint_after(self.next_update_check - now);
+            return;
+        }
+        self.checking_updates = true;
+        self.next_update_check = now + update::CHECK_INTERVAL;
+        let sender = self.sender.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = update::check().map_err(|error| format!("{error:#}"));
+            let _ = sender.send(Event::UpdateCheck(result));
+            ctx.request_repaint();
+        });
+    }
+    fn start_update(&mut self, ctx: &egui::Context) {
+        if self.busy || !self.settings.check_updates {
+            return;
+        }
+        let Some(release) = self.available_update.clone() else {
+            return;
         };
+        self.busy = true;
+        self.update_download = Some(0.0);
+        self.error = None;
+        let sender = self.sender.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = update::prepare(&release, |progress| {
+                let _ = sender.send(Event::UpdateProgress(progress));
+                ctx.request_repaint();
+            })
+            .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(Event::UpdatePrepared(result));
+            ctx.request_repaint();
+        });
+    }
+    fn save_settings(&mut self, settings: Settings) -> Result<()> {
         catalog::atomic_write(
             &self.paths.root.join("settings.json"),
             &serde_json::to_vec_pretty(&settings)?,
         )?;
         self.settings = settings;
+        Ok(())
+    }
+    fn save_game(&mut self, path: String, ctx: &egui::Context) -> Result<()> {
+        let info = launch::validate_game(Path::new(path.trim()))?;
+        let settings = Settings {
+            game_path: info.app_path.to_string_lossy().into_owned(),
+            ..self.settings.clone()
+        };
+        self.save_settings(settings)?;
         self.error = None;
         self.status = text(self.language, "Путь к игре сохранён", "Game location saved");
         if self.setup_required {
@@ -552,6 +663,14 @@ impl ManagerApp {
             self.language,
             "Не удалось завершить действие",
             "The action could not be completed",
+        );
+    }
+    fn update_failed(&mut self, message: String) {
+        self.fail(message);
+        self.status = text(
+            self.language,
+            "Не удалось обновить R2MML",
+            "Could not update R2MML",
         );
     }
 }
@@ -587,6 +706,7 @@ impl eframe::App for ManagerApp {
                         Err(e) => self.fail(e),
                     }
                 }
+                Event::CompatibilityPrepared(profile) => self.profile = profile,
                 Event::Launch { modded, result } => {
                     self.busy = false;
                     match result {
@@ -643,30 +763,72 @@ impl eframe::App for ManagerApp {
                         _ => message,
                     };
                 }
+                Event::UpdateCheck(result) => {
+                    self.checking_updates = false;
+                    if self.settings.check_updates && self.update_download.is_none() {
+                        match result {
+                            Ok(release) => self.available_update = release,
+                            Err(error) => self.paths.log(&format!("Update check: {error}")),
+                        }
+                    }
+                }
+                Event::UpdateProgress(fraction) => self.update_download = Some(fraction),
+                Event::UpdatePrepared(result) => {
+                    let result = result.and_then(|prepared| {
+                        prepared
+                            .handoff(&self.paths.logs)
+                            .map_err(|error| format!("{error:#}"))
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.update_download = Some(1.0);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(error) => {
+                            self.busy = false;
+                            self.update_download = None;
+                            self.available_update = None;
+                            self.next_update_check = Instant::now() + update::CHECK_INTERVAL;
+                            self.update_failed(error);
+                        }
+                    }
+                }
             }
         }
-        if self.setup_required {
+        self.check_updates_if_due(ctx);
+        let setup_required = self.setup_required;
+        if setup_required {
             self.show_setup(ctx);
+        }
+        let available_update = self
+            .available_update
+            .as_ref()
+            .map(|release| release.version.to_string());
+        let data = UiData {
+            language: self.language,
+            catalog: &self.catalog,
+            installed: &self.profile.installed,
+            game_path: &self.settings.game_path,
+            status: &self.status,
+            busy: self.busy,
+            progress: None,
+            error: self.error.as_deref(),
+            readme: self.readme.as_deref(),
+            changelog: self.changelog.as_deref(),
+            check_updates: self.settings.check_updates,
+            available_update: available_update.as_deref(),
+            update_download: self.update_download,
+        };
+        let actions = if setup_required {
+            let mut actions = Vec::new();
+            self.ui.update_dialog(ctx, &data, &mut actions);
+            actions
         } else {
-            let actions = self.ui.show(
-                ctx,
-                UiData {
-                    language: self.language,
-                    catalog: &self.catalog,
-                    installed: &self.profile.installed,
-                    game_path: &self.settings.game_path,
-                    status: &self.status,
-                    busy: self.busy,
-                    progress: None,
-                    error: self.error.as_deref(),
-                    readme: self.readme.as_deref(),
-                    changelog: self.changelog.as_deref(),
-                },
-            );
-            for action in actions {
-                if let Err(error) = self.action(action, ctx) {
-                    self.fail(format!("{error:#}"));
-                }
+            self.ui.show(ctx, data)
+        };
+        for action in actions {
+            if let Err(error) = self.action(action, ctx) {
+                self.fail(format!("{error:#}"));
             }
         }
         #[cfg(debug_assertions)]
@@ -720,6 +882,11 @@ pub fn run_cli() -> Result<bool> {
         return Ok(true);
     }
     let paths = Paths::new()?;
+    #[cfg(target_os = "macos")]
+    if args[0] == "--apply-update" {
+        update::apply_pending(&args[1..], &paths.root, &paths.logs)?;
+        return Ok(true);
+    }
     let _lock = paths.lock()?;
     match args[0].as_str() {
         "--check" => {
@@ -753,6 +920,8 @@ pub fn run_cli() -> Result<bool> {
             let game = args.get(1).context("Launch requires the game .app path")?;
             let modded = args[0] == "--launch-modded";
             let runtime = if modded {
+                launch::validate_game(Path::new(game))?;
+                install::prepare_compatibility(&paths.profile, &paths.cache, |s| eprintln!("{s}"))?;
                 launch::ensure_runtime(&paths.cache, &|s| eprintln!("{s}"))?
             } else {
                 paths.cache.clone()
@@ -770,6 +939,22 @@ pub fn run_cli() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_settings_enable_updates_and_preserve_an_explicit_opt_out() {
+        let legacy: Settings = serde_json::from_str(r#"{"game_path":"/old.app"}"#).unwrap();
+        assert!(legacy.check_updates);
+        assert_eq!(legacy.game_path, "/old.app");
+        let settings = Settings {
+            check_updates: false,
+            ..legacy
+        };
+        assert!(
+            !serde_json::from_slice::<Settings>(&serde_json::to_vec(&settings).unwrap())
+                .unwrap()
+                .check_updates
+        );
+    }
 
     fn game_fixture(root: &Path, name: &str) -> PathBuf {
         let game = root.join(format!("{name}.app"));

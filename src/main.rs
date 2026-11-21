@@ -6,6 +6,7 @@ mod install;
 mod launch;
 mod markdown;
 mod ui;
+mod update;
 
 fn main() -> anyhow::Result<()> {
     if app::run_cli()? {

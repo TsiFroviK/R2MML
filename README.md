@@ -61,6 +61,10 @@ R2MML uses the official [BepInEx 5.4.23.6 macOS universal release](https://githu
 
 Thunderstore's **bbepis-BepInExPack** is treated as a runtime requirement provided by this macOS runtime. Its Windows loader files and Windows distribution's additional default packages are not installed. Normal mods' own explicit dependencies are still resolved and installed, including game-specific packages if they name them directly.
 
+R2MML supplies a verified macOS adaptation of **RoR2BepInExPack** for R2API Core and the modules that depend on it. Installing or updating R2API prepares the compatibility layer automatically. Installed packages using it show an **R2MML Patch** badge. New R2API versions can use the same layer when their requirements remain compatible. A new, unsupported version of the underlying pack requires its own verified adaptation.
+
+The manager checks GitHub Releases at startup and periodically. Choose **Update** to download the universal DMG and restart with the new version at the same application path. Choose **Later** to defer the prompt, or **Don't remind me** to turn checks off. Re-enable them in **Settings**.
+
 Managed `.dll` mods can work on macOS, but compatibility depends on the individual mod and game version. Windows-native DLLs and Windows-only integrations cannot be made compatible merely by downloading them. R2MML rejects native Windows DLLs in the active plugin set. Other platform-specific assumptions may still fail at runtime; check the logs and disable the affected mod.
 
 Native Apple Silicon validation includes loading **ProperSave 3.1.3** and **HookGenPatcher 1.2.9** through the macOS BepInEx runtime. This does not establish compatibility with every Thunderstore package or confirm Intel gameplay.

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 
 use crate::catalog::Package;
-use crate::install::InstalledMod;
+use crate::install::{InstalledMod, MacCompatibility};
 use crate::launch::RUNTIME_VERSION;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,6 +31,9 @@ pub struct UiData<'a> {
     pub error: Option<&'a str>,
     pub readme: Option<&'a str>,
     pub changelog: Option<&'a str>,
+    pub check_updates: bool,
+    pub available_update: Option<&'a str>,
+    pub update_download: Option<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +49,10 @@ pub enum UiAction {
     OpenUrl(String),
     OpenLogs,
     SelectPackage { package: String, version: String },
+    UpdateNow,
+    UpdateLater,
+    IgnoreUpdates,
+    SetUpdateChecks(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -396,6 +403,13 @@ impl UiState {
         self.remove_dialog(ctx, &data, &mut actions);
         self.disable_dialog(ctx, &data, &mut actions);
         self.modded_launch_error_dialog(ctx, lang, &mut actions);
+        if self.download.is_none()
+            && self.remove.is_none()
+            && self.disable.is_none()
+            && self.modded_launch_error.is_none()
+        {
+            self.update_dialog(ctx, &data, &mut actions);
+        }
         actions
     }
 
@@ -616,6 +630,7 @@ impl UiState {
                                 None
                             },
                             None,
+                            None,
                             data.busy,
                             lang,
                         )
@@ -701,6 +716,7 @@ impl UiState {
                             } else {
                                 Some(lang.text("Dependency", "Зависимость"))
                             },
+                            crate::install::macos_compatibility(item, data.installed),
                             Some(item.enabled),
                             data.busy,
                             lang,
@@ -1020,11 +1036,82 @@ impl UiState {
                 });
             });
         ui.add_space(16.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(20)
+            .corner_radius(14)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(lang.text("Check for updates", "Проверять обновления"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled_ui(!data.busy, |ui| {
+                            toggle_switch(ui, data.check_updates, lang).clicked()
+                        }).inner {
+                            actions.push(UiAction::SetUpdateChecks(!data.check_updates));
+                        }
+                    });
+                });
+            });
+        ui.add_space(16.0);
         ui.label(format!(
             "{}: {}",
             lang.text("Interface language", "Язык интерфейса"),
             lang.text("English", "Русский")
         ));
+    }
+
+    pub(crate) fn update_dialog(&self, ctx: &egui::Context, data: &UiData<'_>, actions: &mut Vec<UiAction>) {
+        let lang = data.language;
+        let version = data.available_update;
+        let progress = data.update_download;
+        if progress.is_none() && (data.busy || version.is_none()) {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("app_update")).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 64.0).clamp(250.0, 450.0));
+            if let Some(fraction) = progress {
+                ui.heading(lang.text("Updating R2MML", "Обновление R2MML"));
+                ui.add_space(8.0);
+                ui.label(if fraction < 1.0 {
+                    lang.text("Downloading the disk image…", "Скачивание образа DMG…")
+                } else {
+                    lang.text("Verifying and installing…", "Проверка и установка…")
+                });
+                ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                return false;
+            }
+            ui.heading(lang.text("R2MML update available", "Доступно обновление R2MML"));
+            ui.add_space(6.0);
+            if let Some(version) = version {
+                ui.label(format!("R2MML {} → {version}", env!("CARGO_PKG_VERSION")));
+            }
+            ui.label(lang.text(
+                "R2MML will install the update and restart.",
+                "R2MML установит обновление и перезапустится.",
+            ));
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(
+                    RichText::new(lang.text("Update", "Обновить")).color(Color32::WHITE),
+                ).fill(BLUE)).clicked() {
+                    actions.push(UiAction::UpdateNow);
+                    return true;
+                }
+                if ui.button(lang.text("Later", "Позже")).clicked() {
+                    actions.push(UiAction::UpdateLater);
+                    return true;
+                }
+                if ui.button(lang.text("Don't remind me", "Не напоминать")).clicked() {
+                    actions.push(UiAction::IgnoreUpdates);
+                    return true;
+                }
+                false
+            }).inner
+        });
+        if progress.is_none() && !modal.inner && modal.should_close() {
+            actions.push(UiAction::UpdateLater);
+        }
     }
 
     fn download_dialog(
@@ -1659,6 +1746,7 @@ fn package_row(
     description: &str,
     selected: bool,
     badge: Option<&str>,
+    patch: Option<MacCompatibility>,
     enabled: Option<bool>,
     busy: bool,
     lang: Language,
@@ -1708,12 +1796,40 @@ fn package_row(
                                 // switch stays at the same trailing edge of its card.
                                 ui.set_width(text_width);
                                 ui.spacing_mut().item_spacing.y = 3.0;
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(name.replace('_', " ")).strong(),
-                                    )
-                                    .truncate(),
-                                );
+                                let title = egui::Label::new(
+                                    RichText::new(name.replace('_', " ")).strong(),
+                                ).truncate();
+                                if let Some(patch) = patch {
+                                    let patch_label = lang.text("R2MML Patch", "R2MML Патч");
+                                    let badge_text = ui.painter().layout_no_wrap(
+                                        patch_label.to_owned(), FontId::proportional(10.0), Color32::WHITE,
+                                    );
+                                    let badge_width = badge_text.size().x + 12.0;
+                                    ui.horizontal(|ui| {
+                                        let title_width = (text_width - badge_width - ui.spacing().item_spacing.x).max(0.0);
+                                        ui.scope(|ui| {
+                                            ui.set_max_width(title_width);
+                                            ui.add(title);
+                                        });
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            Vec2::new(badge_width, 16.0), egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(rect, 4.0, BLUE);
+                                        ui.painter().galley(rect.center() - badge_text.size() / 2.0, badge_text, Color32::WHITE);
+                                        response.on_hover_text(match patch {
+                                            MacCompatibility::Adapted => lang.text(
+                                                "R2MML patched this package for macOS.",
+                                                "R2MML адаптировал этот пакет для macOS.",
+                                            ),
+                                            MacCompatibility::CompatibilityLayer => lang.text(
+                                                "This module uses the R2MML macOS patch.",
+                                                "Этот модуль использует патч R2MML для macOS.",
+                                            ),
+                                        });
+                                    });
+                                } else {
+                                    ui.add(title);
+                                }
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(format!(
@@ -1737,37 +1853,11 @@ fn package_row(
                         );
                         if let Some(value) = enabled {
                             ui.add_enabled_ui(!busy, |ui| {
-                                let (rect, response) = ui.allocate_exact_size(
-                                    Vec2::new(34.0, 22.0),
-                                    egui::Sense::click(),
-                                );
-                                switch_rect = Some(rect);
-                                let fill = if value {
-                                    BLUE
-                                } else {
-                                    ui.visuals().widgets.inactive.bg_fill
-                                };
-                                ui.painter().rect_filled(rect, 11.0, fill);
-                                ui.painter().circle_filled(
-                                    egui::pos2(
-                                        if value {
-                                            rect.right() - 11.0
-                                        } else {
-                                            rect.left() + 11.0
-                                        },
-                                        rect.center().y,
-                                    ),
-                                    8.0,
-                                    Color32::WHITE,
-                                );
+                                let response = toggle_switch(ui, value, lang);
+                                switch_rect = Some(response.rect);
                                 if response.clicked() {
                                     toggle = Some(!value);
                                 }
-                                response.on_hover_text(if value {
-                                    lang.text("Disable", "Отключить")
-                                } else {
-                                    lang.text("Enable", "Включить")
-                                });
                             });
                         }
                     });
@@ -1786,6 +1876,22 @@ fn package_row(
         })
         .inner;
     (response.clicked(), toggle)
+}
+
+fn toggle_switch(ui: &mut egui::Ui, enabled: bool, lang: Language) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(34.0, 22.0), egui::Sense::click());
+    let fill = if enabled { BLUE } else { ui.visuals().widgets.inactive.bg_fill };
+    ui.painter().rect_filled(rect, 11.0, fill);
+    ui.painter().circle_filled(
+        egui::pos2(rect.center().x + if enabled { 6.0 } else { -6.0 }, rect.center().y),
+        8.0,
+        Color32::WHITE,
+    );
+    response.on_hover_text(if enabled {
+        lang.text("Disable", "Отключить")
+    } else {
+        lang.text("Enable", "Включить")
+    })
 }
 
 fn empty(ui: &mut egui::Ui, _lang: Language, title: &str, description: &str) {
@@ -1855,6 +1961,7 @@ mod tests {
             state.disable_dialog(ctx, &UiData {
                 language: lang, catalog: &[], installed: &[], game_path: "", status: "",
                 busy, progress: None, error: None, readme: None, changelog: None,
+                check_updates: true, available_update: None, update_download: None,
             }, &mut actions);
         });
         (actions, output)
@@ -2006,7 +2113,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     action = package_row(
                         ui, "example", "Example", "Author", "1.0.0", "", "Description",
-                        false, None, Some(enabled), busy, Language::En,
+                        false, None, None, Some(enabled), busy, Language::En,
                     );
                 });
             },

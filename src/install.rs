@@ -6,9 +6,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    io::Cursor,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
 };
+
+#[path = "compat.rs"]
+mod compat;
 
 const PROVIDED_RUNTIME: &str = "bbepis-BepInExPack";
 const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
@@ -29,6 +32,56 @@ pub struct InstalledMod {
     pub icon: String,
     #[serde(default)]
     pub dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_adapter: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MacCompatibility {
+    Adapted,
+    CompatibilityLayer,
+}
+
+fn is_adapted(package: &InstalledMod) -> bool {
+    package.full_name == compat::PACK
+        && package.macos_adapter.as_deref() == Some(compat::ADAPTER)
+        && compat::can_adapt(&package.full_name, &package.version)
+}
+
+pub(crate) fn macos_compatibility(
+    package: &InstalledMod,
+    installed: &[InstalledMod],
+) -> Option<MacCompatibility> {
+    if is_adapted(package) {
+        return Some(MacCompatibility::Adapted);
+    }
+    if !(package.full_name.starts_with("RiskofThunder-R2API_")
+        || package.full_name == "tristanmcpherson-R2API")
+    {
+        return None;
+    }
+    let mut pending = vec![package];
+    let mut visited = BTreeSet::new();
+    while let Some(item) = pending.pop() {
+        if !visited.insert(&item.full_name) {
+            continue;
+        }
+        for reference in &item.dependencies {
+            let Ok((name, minimum)) = dependency(reference) else {
+                continue;
+            };
+            let Some(target) = installed.iter().find(
+                |p| p.full_name == name && Version::parse(&p.version).is_ok_and(|v| v >= minimum),
+            ) else {
+                continue;
+            };
+            if is_adapted(target) {
+                return Some(MacCompatibility::CompatibilityLayer);
+            }
+            pending.push(target);
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -111,6 +164,11 @@ pub fn plan_install(
     let root_version = package
         .version(version)
         .context("Selected version is unavailable")?;
+    anyhow::ensure!(
+        compat::can_adapt(&package.full_name, version),
+        "{} {version} has no verified macOS adapter",
+        package.name
+    );
     let pinned = Version::parse(version)?;
     let existing: BTreeMap<&str, &InstalledMod> = state
         .installed
@@ -162,8 +220,8 @@ pub fn plan_install(
             if name == PROVIDED_RUNTIME {
                 continue;
             }
-            for dep in &current.version.dependencies {
-                let (name, minimum) = dependency(dep)?;
+            for dep in package_dependencies(&name, &current.version) {
+                let (name, minimum) = dependency(&dep)?;
                 requirements
                     .entry(name)
                     .and_modify(|v| *v = v.clone().max(minimum.clone()))
@@ -193,13 +251,14 @@ pub fn plan_install(
                 .and_then(|p| Version::parse(&p.version).ok());
             let reusable = existing_version
                 .filter(|v| v >= minimum)
+                .filter(|v| compat::can_adapt(name, &v.to_string()))
                 .and_then(|v| dependency_package.version(&v.to_string()));
             let version = reusable
                 .or_else(|| {
                     dependency_package
                         .versions
                         .iter()
-                        .filter(|v| v.is_active)
+                        .filter(|v| v.is_active && compat::can_adapt(name, &v.version_number))
                         .filter_map(|v| {
                             Version::parse(&v.version_number)
                                 .ok()
@@ -209,7 +268,13 @@ pub fn plan_install(
                         .max_by(|(a, _), (b, _)| a.cmp(b))
                         .map(|(_, v)| v)
                 })
-                .with_context(|| format!("No version of {name} satisfies {minimum}"))?;
+                .with_context(|| {
+                    if name == compat::PACK {
+                        format!("No macOS-adapted version of {name} satisfies {minimum}")
+                    } else {
+                        format!("No version of {name} satisfies {minimum}")
+                    }
+                })?;
             selected.insert(
                 name.clone(),
                 PlannedPackage {
@@ -229,6 +294,15 @@ pub fn plan_install(
     Ok(InstallPlan {
         packages: selected.into_values().collect(),
     })
+}
+
+fn package_dependencies(name: &str, version: &PackageVersion) -> Vec<String> {
+    if name == PROVIDED_RUNTIME {
+        return Vec::new();
+    }
+    let mut dependencies = version.dependencies.clone();
+    compat::add_dependencies(name, &version.version_number, &mut dependencies);
+    dependencies
 }
 
 fn archive_for(version: &PackageVersion, cache: &Path) -> Result<Vec<u8>> {
@@ -327,6 +401,18 @@ pub fn install(
     cache: &Path,
     progress: impl Fn(&str),
 ) -> Result<ProfileState> {
+    install_packages(package, version, catalog, profile, cache, progress, true)
+}
+
+fn install_packages(
+    package: &Package,
+    version: &str,
+    catalog: &[Package],
+    profile: &Path,
+    cache: &Path,
+    progress: impl Fn(&str),
+    mark_root_explicit: bool,
+) -> Result<ProfileState> {
     fs::create_dir_all(profile)?;
     let plan = plan_install(package, version, catalog, profile)?;
     let mut state = ProfileState::load(profile)?;
@@ -336,6 +422,7 @@ pub fn install(
         validate_component(&item.package.full_name)?;
         validate_component(&item.version.full_name)?;
         progress(&item.version.full_name);
+        let mut macos_adapter = None;
         if item.package.full_name != PROVIDED_RUNTIME {
             let destination = packages.join(&item.version.full_name);
             if !destination.join(".r2mml-complete").is_file() {
@@ -346,14 +433,22 @@ pub fn install(
                     .prefix(".install-")
                     .tempdir_in(&packages)?;
                 extract_archive(&archive_for(&item.version, cache)?, temporary.path())?;
+                if item.package.full_name == compat::PACK {
+                    compat::prepare_pack(profile, temporary.path(), &item.version.version_number)?;
+                }
                 fs::write(
                     temporary.path().join(".r2mml-complete"),
                     &item.version.full_name,
                 )?;
                 fs::rename(temporary.path(), &destination)?;
+            } else if item.package.full_name == compat::PACK {
+                compat::prepare_pack(profile, &destination, &item.version.version_number)?;
+            }
+            if item.package.full_name == compat::PACK {
+                macos_adapter = Some(compat::ADAPTER.into());
             }
         }
-        let explicit = item.package.full_name == package.full_name
+        let explicit = (mark_root_explicit && item.package.full_name == package.full_name)
             || state
                 .installed
                 .iter()
@@ -367,11 +462,8 @@ pub fn install(
             explicit,
             description: item.version.description.clone(),
             icon: item.version.icon.clone(),
-            dependencies: if item.package.full_name == PROVIDED_RUNTIME {
-                Vec::new()
-            } else {
-                item.version.dependencies.clone()
-            },
+            dependencies: package_dependencies(&item.package.full_name, &item.version),
+            macos_adapter,
         };
         state
             .installed
@@ -385,6 +477,57 @@ pub fn install(
     validate_enabled_dependencies(&state)?;
     state.save(profile)?;
     Ok(state)
+}
+
+/// Backfill the Mac-specific dependency in profiles created by earlier releases.
+/// Existing profiles that already have the adapter need no catalog access.
+pub fn prepare_compatibility(
+    profile: &Path,
+    cache: &Path,
+    progress: impl Fn(&str),
+) -> Result<Option<ProfileState>> {
+    let mut state = ProfileState::load(profile)?;
+    let core = state.installed.iter().position(|p| p.enabled && p.full_name == compat::CORE);
+    let pack = state.installed.iter().position(|p| p.full_name == compat::PACK);
+    let mut changed = false;
+    if let Some(index) = core {
+        let mut dependencies = state.installed[index].dependencies.clone();
+        compat::add_dependencies(compat::CORE, &state.installed[index].version, &mut dependencies);
+        if dependencies != state.installed[index].dependencies {
+            let (_, minimum) = dependency(compat::PACK_DEPENDENCY)?;
+            let usable = pack.is_some_and(|i| {
+                let p = &state.installed[i];
+                (p.enabled || state.disabled_dependency_overrides.contains(compat::PACK))
+                    && compat::can_adapt(&p.full_name, &p.version)
+                    && Version::parse(&p.version).is_ok_and(|v| v >= minimum)
+            });
+            if !usable {
+                let catalog = crate::catalog::fetch_catalog(cache)?;
+                let package = catalog.iter().find(|p| p.full_name == compat::CORE)
+                    .context("R2API Core is missing from the Thunderstore catalog")?;
+                return install_packages(
+                    package, &state.installed[index].version, &catalog, profile, cache, progress, false,
+                ).map(Some);
+            }
+            state.installed[index].dependencies = dependencies;
+            changed = true;
+        }
+    }
+    if let Some(index) = pack {
+        let package = &mut state.installed[index];
+        if package.enabled && !is_adapted(package) {
+            let source = profile.join("packages")
+                .join(format!("{}-{}", package.full_name, package.version));
+            compat::prepare_pack(profile, &source, &package.version)?;
+            package.macos_adapter = Some(compat::ADAPTER.into());
+            changed = true;
+        }
+    }
+    if changed {
+        validate_enabled_dependencies(&state)?;
+        state.save(profile)?;
+    }
+    Ok(changed.then_some(state))
 }
 
 fn validate_enabled_dependencies(state: &ProfileState) -> Result<()> {
@@ -559,12 +702,27 @@ fn list_files(root: &Path, directory: &Path, output: &mut Vec<PathBuf>) -> Resul
         if kind.is_dir() {
             list_files(root, &entry.path(), output)?;
         } else if kind.is_file() {
+            if is_apple_double(&entry.path())? {
+                continue;
+            }
             output.push(entry.path().strip_prefix(root)?.to_owned());
         } else {
             bail!("Package contains a special file");
         }
     }
     Ok(())
+}
+
+fn is_apple_double(path: &Path) -> Result<bool> {
+    if !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("._")) {
+        return Ok(false);
+    }
+    let mut magic = [0; 4];
+    match fs::File::open(path)?.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == [0x00, 0x05, 0x16, 0x07]),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn mapped_path(relative: &Path, package: &str) -> Result<Option<PathBuf>> {
@@ -665,6 +823,11 @@ pub fn materialize(profile: &Path) -> Result<PathBuf> {
         }
         let mut files = Vec::new();
         list_files(&source, &source, &mut files)?;
+        let adapted = if package.full_name == compat::PACK {
+            Some(compat::prepare_pack(profile, &source, &package.version)?)
+        } else {
+            None
+        };
         for relative in files {
             let Some(mapped) = mapped_path(&relative, &package.full_name)? else {
                 continue;
@@ -687,6 +850,11 @@ pub fn materialize(profile: &Path) -> Result<PathBuf> {
             }
             let target = temporary.path().join(mapped);
             fs::create_dir_all(target.parent().unwrap())?;
+            let from = if relative == Path::new(compat::DLL) {
+                adapted.as_deref().unwrap_or(&from)
+            } else {
+                &from
+            };
             fs::copy(from, target)?;
         }
     }
@@ -849,6 +1017,52 @@ mod tests {
         runtime.full_name = PROVIDED_RUNTIME.into();
         let plan = plan_install(&a, "1.0.0", &[a.clone(), runtime], dir.path()).unwrap();
         assert_eq!(plan.packages.len(), 2);
+    }
+
+    #[test]
+    fn newer_r2api_core_reuses_the_adapted_platform_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = package("R2API_Core", &[("5.3.0", &[]), ("5.4.0", &[])]);
+        core.full_name = compat::CORE.into();
+        let mut pack = package("RoR2BepInExPack", &[("1.50.0", &[]), ("1.51.0", &[])]);
+        pack.full_name = compat::PACK.into();
+        let catalog = [core.clone(), pack.clone()];
+        let plan = plan_install(&core, "5.4.0", &catalog, dir.path()).unwrap();
+        assert_eq!(
+            plan.packages.iter().map(|p| (p.package.full_name.as_str(), p.version.version_number.as_str()))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([(compat::CORE, "5.4.0"), (compat::PACK, "1.50.0")]),
+        );
+        assert!(plan_install(&pack, "1.51.0", &catalog, dir.path()).is_err());
+    }
+
+    #[test]
+    fn badge_requires_an_adapted_provider_in_the_dependency_graph() {
+        let mut core = installed("Core", true, &[compat::PACK_DEPENDENCY]);
+        core.full_name = compat::CORE.into();
+        core.version = "5.3.0".into();
+        let mut addressables = installed("Addressables", true, &["RiskofThunder-R2API_Core-5.3.0"]);
+        addressables.full_name = "RiskofThunder-R2API_Addressables".into();
+        let mut pack = installed("Pack", true, &[]);
+        pack.full_name = compat::PACK.into();
+        pack.version = "1.50.0".into();
+        assert_eq!(macos_compatibility(&addressables, &[core.clone(), pack.clone()]), None);
+        pack.macos_adapter = Some(compat::ADAPTER.into());
+        assert_eq!(
+            macos_compatibility(&addressables, &[core, pack.clone()]),
+            Some(MacCompatibility::CompatibilityLayer)
+        );
+        assert_eq!(macos_compatibility(&pack, &[]), Some(MacCompatibility::Adapted));
+    }
+
+    #[test]
+    fn excludes_apple_double_metadata_without_hiding_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("._Assembly.dll"), [0, 5, 22, 7]).unwrap();
+        fs::write(dir.path().join("._payload"), b"ordinary file").unwrap();
+        let mut files = Vec::new();
+        list_files(dir.path(), dir.path(), &mut files).unwrap();
+        assert_eq!(files, vec![PathBuf::from("._payload")]);
     }
     #[test]
     fn extraction_does_not_escape_destination() {

@@ -98,7 +98,7 @@ fn require_compatible_host(game_architecture: &str, host_has_arm64: bool) -> Res
     Ok(())
 }
 
-fn macho_architectures(data: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn macho_architectures(data: &[u8]) -> Result<Vec<String>> {
     ensure!(data.len() >= 8, "Native executable is truncated");
     let be = |at: usize| -> Result<u32> {
         Ok(u32::from_be_bytes(
